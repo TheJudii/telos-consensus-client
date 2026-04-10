@@ -190,14 +190,23 @@ impl PrintedReceipt {
             if let Some(end) = console[start_index..].find(end_pattern) {
                 let end_index = start_index + end;
                 let extracted = &console[start_index..end_index];
-                let printed_receipt = serde_json::from_str::<PrintedReceipt>(extracted).unwrap();
-                Some(printed_receipt)
+                match serde_json::from_str::<PrintedReceipt>(extracted) {
+                    Ok(printed_receipt) => Some(printed_receipt),
+                    Err(e) => {
+                        warn!("Failed to parse PrintedReceipt JSON: {} (payload: {})", e, extracted);
+                        None
+                    }
+                }
             } else {
-                warn!("End pattern not found.");
+                warn!("End pattern not found in console output.");
                 None
             }
         } else {
-            warn!("Start pattern not found.");
+            // This branch is hit for both genuinely empty consoles and for
+            // consoles that contain binary data that resolved to text without
+            // the expected RCPT{{...}}RCPT marker. The caller should decide
+            // whether to hard-fail or skip.
+            warn!("Start pattern not found in console output (console_len={}).", console.len());
             None
         }
     }

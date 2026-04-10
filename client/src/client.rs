@@ -28,9 +28,9 @@ pub enum Error {
     // SpawnTranslator,
     #[error("Executor hash mismatch.")]
     ExecutorHashMismatch,
-    #[error("Fork choice updated error")]
+    #[error("Fork choice updated error: {0}")]
     ForkChoiceUpdated(String),
-    #[error("New payload error")]
+    #[error("New payload error: {0}")]
     NewPayloadV1(String),
     #[error("Database error: {0}")]
     Database(eyre::Report),
@@ -234,11 +234,11 @@ impl ConsensusClient {
                 .map(|block| block.hash.parse().unwrap())
                 .unwrap_or(block_hash);
 
+            // Telos test mode: zero finalized triggers optimistic sync in reth v1.11.3
             let finalized_hash = if block_is_final {
                 debug!("Synced to head, LIB < current block");
                 Some(block_hash)
             } else if is_new_lib {
-                // if lib hash has been changed we should send finalized hash for fork choice update
                 debug!("New LIB is detected");
                 self.db
                     .get_block_or_prev(lib_evm_num)?
@@ -262,6 +262,16 @@ impl ConsensusClient {
         finalized_hash: Option<B256>,
         safe_hash: B256,
     ) -> Result<(), Error> {
+        // Telos: Write extra fields to filesystem for the executor to pick up
+        let extra_dir = std::path::Path::new("/tmp/telos-extra-fields");
+        let _ = std::fs::create_dir_all(extra_dir);
+        for block in batch {
+            let path = extra_dir.join(format!("{:?}.json", block.block_hash));
+            if let Ok(json) = serde_json::to_string(&block.extra_fields) {
+                let _ = std::fs::write(&path, json);
+            }
+        }
+
         let rpc_batch = batch
             .iter()
             .map(|block| {
@@ -321,7 +331,12 @@ impl ConsensusClient {
             info!("fork_choice_updated_result {:?}", fork_choice_updated);
 
             // Valid, Invalid, Accepted, Syncing
-            if fork_choice_updated.is_invalid() || fork_choice_updated.is_syncing() {
+            if fork_choice_updated.is_syncing() {
+                // SYNCING is normal during initial sync - reth is catching up, just log and continue
+                info!(
+                    "Fork choice update status is SYNCING (reth still syncing, continuing...)",
+                );
+            } else if fork_choice_updated.is_invalid() {
                 info!(
                     "Fork choice update status is {} ",
                     fork_choice_updated.payload_status.status

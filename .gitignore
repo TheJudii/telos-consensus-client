@@ -5,3 +5,4 @@ translator-config.toml
 *.csv
 *.log
 *.pid
+/testnet*

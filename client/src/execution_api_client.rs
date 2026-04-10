@@ -33,7 +33,7 @@ impl fmt::Display for JsonErrors {
         let Self(errors) = self;
         let errors = errors
             .iter()
-            .map(|(id, error)| format!("({id}, {}", error.message))
+            .map(|(id, error)| format!("({id}, {} data={:?})", error.message, error.data))
             .collect::<Vec<String>>()
             .join(", ");
         write!(f, "{errors}")

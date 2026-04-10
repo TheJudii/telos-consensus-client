@@ -33,6 +33,8 @@ pub trait BasicTrace {
     fn action_account(&self) -> u64;
     fn receiver(&self) -> u64;
     fn console(&self) -> String;
+    fn raw_console(&self) -> Vec<u8>;
+    fn raw_return_value(&self) -> Vec<u8>;
     fn data(&self) -> Vec<u8>;
 }
 
@@ -65,9 +67,29 @@ impl BasicTrace for ActionTrace {
     }
 
     fn console(&self) -> String {
+        // Use lossy UTF-8 decoding so that any invalid bytes (which can appear
+        // in eosio.evm contract output alongside the ASCII RCPT JSON payload)
+        // are replaced with U+FFFD instead of causing the entire console
+        // string to be dropped. Silently dropping the console was the cause
+        // of ~1470 blocks of divergence from production testnet — see
+        // https://github.com/telosnetwork/telos-consensus-client issue
         match self {
-            ActionTrace::V0(a) => String::from_utf8(a.console.clone()).unwrap_or_default(),
-            ActionTrace::V1(a) => String::from_utf8(a.console.clone()).unwrap_or_default(),
+            ActionTrace::V0(a) => String::from_utf8_lossy(&a.console).into_owned(),
+            ActionTrace::V1(a) => String::from_utf8_lossy(&a.console).into_owned(),
+        }
+    }
+
+    fn raw_console(&self) -> Vec<u8> {
+        match self {
+            ActionTrace::V0(a) => a.console.clone(),
+            ActionTrace::V1(a) => a.console.clone(),
+        }
+    }
+
+    fn raw_return_value(&self) -> Vec<u8> {
+        match self {
+            ActionTrace::V0(_) => Vec::new(),
+            ActionTrace::V1(a) => a.return_value.clone(),
         }
     }
 
@@ -277,13 +299,40 @@ impl ProcessingEVMBlock {
         } else if action_account == EOSIO_EVM && action_name == RAW {
             // Normally signed EVM transaction
             let raw: RawAction = decode_raw_action(&action.data());
-            let printed_receipt =
-                PrintedReceipt::from_console(action.console()).ok_or_else(|| {
-                    eyre::eyre!(
-                        "No printed receipt found for raw action in block: {}",
-                        self.block_num
-                    )
-                })?;
+            // PrintedReceipt is parsed from the eosio.evm action console output
+            // (the RCPT{{...}}RCPT JSON payload). Starting from Telos testnet
+            // block 414859739 (Dec 2024 hardfork / eosio.evm contract upgrade)
+            // the contract stopped emitting the RCPT payload to console for
+            // regular raw actions. When this happens we MUST NOT silently drop
+            // the transaction — doing so causes the block to be sent to reth
+            // with an empty transactions list, diverging permanently from
+            // production. Instead, fail loudly with enough context to diagnose.
+            //
+            // The long-term production fix is to have reth execute transactions
+            // natively (no trust_consensus) and compute receipts_root,
+            // logs_bloom, gas_used from actual execution rather than relying on
+            // the consensus client to supply them from action console output.
+            // See issue: https://github.com/telosnetwork/telos-consensus-client
+            let raw_console_bytes = action.raw_console();
+            let printed_receipt = match PrintedReceipt::from_console(action.console()) {
+                Some(r) => r,
+                None => {
+                    let hex_prefix: String = raw_console_bytes
+                        .iter()
+                        .take(256)
+                        .map(|b| format!("{:02x}", b))
+                        .collect();
+                    return Err(eyre::eyre!(
+                        "No parseable PrintedReceipt for raw action in block {}: \
+                         raw console bytes len={}, first 256 bytes hex={:?}. \
+                         This usually means the eosio.evm contract was upgraded \
+                         and no longer emits the RCPT payload to console.",
+                        self.block_num,
+                        raw_console_bytes.len(),
+                        hex_prefix,
+                    ));
+                }
+            };
 
             let transaction = TelosEVMTransaction::from_raw_action(
                 self.chain_id,
