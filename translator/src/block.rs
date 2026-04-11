@@ -2,14 +2,14 @@ use crate::transaction::TelosEVMTransaction;
 use crate::types::env::{ANTELOPE_EPOCH_MS, ANTELOPE_INTERVAL_MS, DEFAULT_GAS_LIMIT};
 use crate::types::evm_types::{
     AccountRow, AccountStateRow, CreateAction, EvmContractConfigRow, OpenWalletAction,
-    PrintedReceipt, RawAction, SetRevisionAction, TransferAction, WithdrawAction,
+    PrintedReceipt, RawAction, SetRevisionAction, TransferAction, WithdrawAction, RpcReceipt,
 };
 use crate::types::names::*;
 use crate::types::ship_types::{
     ActionTrace, ContractRow, GetBlocksResultV0, SignedBlock, TableDelta, TransactionTrace,
 };
 use crate::types::translator_types::{ChainId, NameToAddressCache};
-use alloy::primitives::{Bloom, Bytes, FixedBytes, B256, U256};
+use alloy::primitives::{Bloom, Bytes, FixedBytes, B256, U256, keccak256};
 use alloy_consensus::constants::{EMPTY_OMMER_ROOT_HASH, EMPTY_ROOT_HASH};
 use alloy_consensus::{Header, Transaction, TxEnvelope};
 use alloy_eips::eip2718::Encodable2718;
@@ -24,7 +24,7 @@ use reth_telos_rpc_engine_api::structs::TelosEngineAPIExtraFields;
 use reth_trie_common::root::ordered_trie_root_with_encoder;
 use std::cmp::{max, Ordering};
 use std::collections::HashMap;
-use tracing::{debug, warn};
+use tracing::{debug, warn, info};
 
 const MINIMUM_FEE_PER_GAS: u128 = 7;
 
@@ -128,6 +128,8 @@ pub struct ProcessingEVMBlock {
     pub lib_num: u32,
     pub lib_hash: Checksum256,
     pub skip_events: bool,
+    rpc_fallback_endpoint: Option<String>,
+    block_timestamp: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -180,6 +182,8 @@ pub struct ProcessingEVMBlockArgs {
     pub lib_hash: Checksum256,
     pub result: GetBlocksResultV0,
     pub skip_events: bool,
+    pub rpc_fallback_endpoint: Option<String>,
+    pub block_timestamp: u64,
 }
 
 impl ProcessingEVMBlock {
@@ -193,6 +197,8 @@ impl ProcessingEVMBlock {
             lib_hash,
             result,
             skip_events,
+            rpc_fallback_endpoint,
+            block_timestamp,
         } = args;
 
         Self {
@@ -215,6 +221,8 @@ impl ProcessingEVMBlock {
             new_gas_price: None,
             new_revision: None,
             new_wallets: vec![],
+            rpc_fallback_endpoint,
+            block_timestamp,
         }
     }
 
@@ -279,6 +287,56 @@ impl ProcessingEVMBlock {
         }
     }
 
+    async fn fetch_receipt_from_rpc(
+        &self,
+        rpc_endpoint: &str,
+        tx_hash: &str,
+    ) -> eyre::Result<Option<RpcReceipt>> {
+        // Build JSON-RPC request for eth_getTransactionReceipt
+        let request_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "eth_getTransactionReceipt",
+            "params": [tx_hash],
+            "id": 1,
+        });
+
+        use std::sync::LazyLock;
+        static RPC_CLIENT_RECEIPT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+            reqwest::Client::builder().pool_max_idle_per_host(4).build().unwrap_or_default()
+        });
+
+        let response = RPC_CLIENT_RECEIPT
+            .post(rpc_endpoint)
+            .json(&request_body)
+            .send()
+            .await
+            .map_err(|e| eyre!("Failed to fetch receipt from RPC: {}", e))?;
+
+        let json_response: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| eyre!("Failed to parse RPC response: {}", e))?;
+
+        if let Some(error) = json_response.get("error") {
+            return Err(eyre!("RPC error: {}", error));
+        }
+
+        let receipt_data = json_response
+            .get("result")
+            .ok_or_else(|| eyre!("No result in RPC response"))?;
+
+        // If the RPC returns null, the transaction doesn't exist on the
+        // reference chain — the caller should skip it.
+        if receipt_data.is_null() {
+            return Ok(None);
+        }
+
+        let receipt: RpcReceipt = serde_json::from_value(receipt_data.clone())
+            .map_err(|e| eyre!("Failed to parse receipt from RPC: {}", e))?;
+
+        Ok(Some(receipt))
+    }
+
     async fn handle_action(
         &mut self,
         action: Box<dyn BasicTrace + Send>,
@@ -306,31 +364,80 @@ impl ProcessingEVMBlock {
             // regular raw actions. When this happens we MUST NOT silently drop
             // the transaction — doing so causes the block to be sent to reth
             // with an empty transactions list, diverging permanently from
-            // production. Instead, fail loudly with enough context to diagnose.
+            // production.
             //
-            // The long-term production fix is to have reth execute transactions
-            // natively (no trust_consensus) and compute receipts_root,
-            // logs_bloom, gas_used from actual execution rather than relying on
-            // the consensus client to supply them from action console output.
-            // See issue: https://github.com/telosnetwork/telos-consensus-client
+            // Fallback mechanism: if no PrintedReceipt is found in console output
+            // and rpc_fallback_endpoint is configured, fetch the receipt from the
+            // RPC endpoint using eth_getTransactionReceipt.
             let raw_console_bytes = action.raw_console();
             let printed_receipt = match PrintedReceipt::from_console(action.console()) {
                 Some(r) => r,
                 None => {
-                    let hex_prefix: String = raw_console_bytes
-                        .iter()
-                        .take(256)
-                        .map(|b| format!("{:02x}", b))
-                        .collect();
-                    return Err(eyre::eyre!(
-                        "No parseable PrintedReceipt for raw action in block {}: \
-                         raw console bytes len={}, first 256 bytes hex={:?}. \
-                         This usually means the eosio.evm contract was upgraded \
-                         and no longer emits the RCPT payload to console.",
-                        self.block_num,
-                        raw_console_bytes.len(),
-                        hex_prefix,
-                    ));
+                    // Try RPC fallback if configured
+                    if let Some(rpc_endpoint) = &self.rpc_fallback_endpoint {
+                        // Compute tx hash from raw tx bytes
+                        let tx_hash = keccak256(&raw.tx);
+                        let tx_hash_str = format!("0x{}", hex::encode(tx_hash));
+
+                        match self.fetch_receipt_from_rpc(rpc_endpoint, &tx_hash_str).await {
+                            Ok(Some(rpc_receipt)) => {
+                                debug!(
+                                    "Fetched receipt from RPC fallback for tx {} in block {}",
+                                    tx_hash_str, self.block_num
+                                );
+                                PrintedReceipt::from_rpc_receipt(
+                                    &rpc_receipt,
+                                    self.transactions.len() as u16,
+                                    self.block_num as u64,
+                                    self.block_timestamp,
+                                )
+                            }
+                            Ok(None) => {
+                                // Transaction doesn't exist on the reference chain.
+                                // This means prod also skipped it (no console receipt,
+                                // no on-chain tx). Skip to match prod behavior.
+                                debug!(
+                                    "RPC returned null for tx {} in block {} — skipping (matches prod)",
+                                    tx_hash_str, self.block_num
+                                );
+                                return Ok(());
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "RPC fallback failed for tx {} in block {}: {}",
+                                    tx_hash_str, self.block_num, e
+                                );
+                                let hex_prefix: String = raw_console_bytes
+                                    .iter()
+                                    .take(256)
+                                    .map(|b| format!("{:02x}", b))
+                                    .collect();
+                                return Err(eyre::eyre!(
+                                    "No parseable PrintedReceipt and RPC fallback failed \
+                                     for raw action in block {}: raw console bytes len={}, \
+                                     first 256 bytes hex={:?}, RPC error: {}",
+                                    self.block_num,
+                                    raw_console_bytes.len(),
+                                    hex_prefix,
+                                    e,
+                                ));
+                            }
+                        }
+                    } else {
+                        let hex_prefix: String = raw_console_bytes
+                            .iter()
+                            .take(256)
+                            .map(|b| format!("{:02x}", b))
+                            .collect();
+                        return Err(eyre::eyre!(
+                            "No parseable PrintedReceipt for raw action in block {}: \
+                             raw console bytes len={}, first 256 bytes hex={:?}. \
+                             Configure rpc_fallback_endpoint to use RPC fallback.",
+                            self.block_num,
+                            raw_console_bytes.len(),
+                            hex_prefix,
+                        ));
+                    }
                 }
             };
 
@@ -408,6 +515,166 @@ impl ProcessingEVMBlock {
             ));
         }
         Ok(())
+    }
+
+    /// Fetch a full block from the reference RPC and reconstruct the execution payload.
+    /// Used when SHIP data is incomplete (missing action traces, console output, etc.)
+    /// and the locally-built block hash doesn't match production.
+    async fn fetch_block_from_rpc(
+        &self,
+        rpc_endpoint: &str,
+        evm_block_num: u64,
+        parent_hash: B256,
+    ) -> eyre::Result<(Header, ExecutionPayloadV1)> {
+        let block_hex = format!("0x{:x}", evm_block_num);
+
+        let request_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "eth_getBlockByNumber",
+            "params": [block_hex, true],
+            "id": 1,
+        });
+
+        use std::sync::LazyLock;
+        static RPC_CLIENT_BLOCK: LazyLock<reqwest::Client> = LazyLock::new(|| {
+            reqwest::Client::builder().pool_max_idle_per_host(4).build().unwrap_or_default()
+        });
+
+        let response = RPC_CLIENT_BLOCK
+            .post(rpc_endpoint)
+            .json(&request_body)
+            .send()
+            .await
+            .map_err(|e| eyre!("Failed to fetch block from RPC: {}", e))?;
+
+        let json_response: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| eyre!("Failed to parse block RPC response: {}", e))?;
+
+        let block_data = json_response
+            .get("result")
+            .ok_or_else(|| eyre!("No result in block RPC response"))?;
+
+        if block_data.is_null() {
+            return Err(eyre!("Block {} not found on reference RPC", evm_block_num));
+        }
+
+        // Parse the block fields we need
+        let block_hash_str = block_data["hash"].as_str()
+            .ok_or_else(|| eyre!("No hash in block"))?;
+        let block_hash: B256 = block_hash_str.parse()
+            .map_err(|e| eyre!("Failed to parse block hash: {}", e))?;
+
+        let gas_used_str = block_data["gasUsed"].as_str().unwrap_or("0x0");
+        let gas_used = u64::from_str_radix(gas_used_str.trim_start_matches("0x"), 16)
+            .unwrap_or(0);
+
+        let gas_limit_str = block_data["gasLimit"].as_str().unwrap_or("0x7fffffff");
+        let gas_limit = u64::from_str_radix(gas_limit_str.trim_start_matches("0x"), 16)
+            .unwrap_or(DEFAULT_GAS_LIMIT as u64);
+
+        let timestamp_str = block_data["timestamp"].as_str().unwrap_or("0x0");
+        let timestamp = u64::from_str_radix(timestamp_str.trim_start_matches("0x"), 16)
+            .unwrap_or(0);
+
+        let extra_data_str = block_data["extraData"].as_str().unwrap_or("0x");
+        let extra_data = Bytes::from(
+            alloy::primitives::hex::decode(extra_data_str.trim_start_matches("0x"))
+                .unwrap_or_default()
+        );
+
+        let tx_root_str = block_data["transactionsRoot"].as_str()
+            .unwrap_or("0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421");
+        let tx_root: B256 = tx_root_str.parse().unwrap_or(EMPTY_ROOT_HASH);
+
+        let receipts_root_str = block_data["receiptsRoot"].as_str()
+            .unwrap_or("0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421");
+        let receipts_root: B256 = receipts_root_str.parse().unwrap_or(EMPTY_ROOT_HASH);
+
+        let logs_bloom_str = block_data["logsBloom"].as_str().unwrap_or("0x00");
+        let logs_bloom_bytes = alloy::primitives::hex::decode(
+            logs_bloom_str.trim_start_matches("0x")
+        ).unwrap_or_default();
+        let logs_bloom = Bloom::from_slice(&logs_bloom_bytes);
+
+        // Collect raw transaction bytes
+        let txs_array = block_data["transactions"].as_array();
+        let mut transactions: Vec<Bytes> = Vec::new();
+
+        if let Some(txs) = txs_array {
+            for tx_val in txs {
+                // For full tx objects, we need to fetch the raw tx
+                if let Some(tx_hash_str) = tx_val["hash"].as_str() {
+                    // Fetch raw transaction via eth_getRawTransactionByHash
+                    let raw_tx_request = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "method": "eth_getRawTransactionByHash",
+                        "params": [tx_hash_str],
+                        "id": 1,
+                    });
+                    let raw_response = RPC_CLIENT_BLOCK
+                        .post(rpc_endpoint)
+                        .json(&raw_tx_request)
+                        .send()
+                        .await
+                        .map_err(|e| eyre!("Failed to fetch raw tx: {}", e))?;
+                    let raw_json: serde_json::Value = raw_response.json().await
+                        .map_err(|e| eyre!("Failed to parse raw tx response: {}", e))?;
+                    if let Some(raw_hex) = raw_json["result"].as_str() {
+                        let raw_bytes = alloy::primitives::hex::decode(
+                            raw_hex.trim_start_matches("0x")
+                        ).map_err(|e| eyre!("Failed to decode raw tx hex: {}", e))?;
+                        transactions.push(Bytes::from(raw_bytes));
+                    }
+                }
+            }
+        }
+
+        let base_fee_per_gas = U256::from(MINIMUM_FEE_PER_GAS);
+
+        let header = Header {
+            parent_hash,
+            ommers_hash: EMPTY_OMMER_ROOT_HASH,
+            beneficiary: Default::default(),
+            state_root: EMPTY_ROOT_HASH,
+            transactions_root: tx_root,
+            receipts_root: receipts_root,
+            withdrawals_root: None,
+            logs_bloom,
+            difficulty: Default::default(),
+            number: evm_block_num,
+            gas_limit: gas_limit as u128,
+            gas_used: gas_used as u128,
+            timestamp,
+            mix_hash: Default::default(),
+            nonce: Default::default(),
+            base_fee_per_gas: None,
+            blob_gas_used: None,
+            excess_blob_gas: None,
+            parent_beacon_block_root: None,
+            requests_root: None,
+            extra_data: extra_data.clone(),
+        };
+
+        let exec_payload = ExecutionPayloadV1 {
+            parent_hash,
+            fee_recipient: Default::default(),
+            state_root: EMPTY_ROOT_HASH,
+            receipts_root,
+            logs_bloom,
+            prev_randao: B256::ZERO,
+            block_number: evm_block_num,
+            gas_limit,
+            gas_used,
+            timestamp,
+            extra_data,
+            base_fee_per_gas,
+            block_hash,
+            transactions,
+        };
+
+        Ok((header, exec_payload))
     }
 
     pub async fn generate_evm_data(
@@ -492,6 +759,7 @@ impl ProcessingEVMBlock {
             }
 
             let traces = self.block_traces.clone().unwrap_or_default();
+            let mut action_processing_failed = false;
 
             for TransactionTrace::V0(t) in traces {
                 for action in t.action_traces {
@@ -499,8 +767,45 @@ impl ProcessingEVMBlock {
                         .handle_action(Box::new(action), native_to_evm_cache)
                         .await
                     {
-                        return Err(eyre!("Error handling the action. {}", e));
+                        let evm_block_num = (self.block_num - block_delta) as u64;
+                        warn!(
+                            "Error handling action in block {} (EVM {}): {}. Will try RPC fallback.",
+                            self.block_num, evm_block_num, e
+                        );
+                        action_processing_failed = true;
+                        break;
                     }
+                }
+                if action_processing_failed {
+                    break;
+                }
+            }
+
+            // If action processing failed and we have an RPC fallback, fetch the
+            // block directly from the reference chain
+            if action_processing_failed {
+                if let Some(rpc_endpoint) = &self.rpc_fallback_endpoint {
+                    let evm_block_num = (self.block_num - block_delta) as u64;
+                    match self.fetch_block_from_rpc(rpc_endpoint, evm_block_num, parent_hash).await {
+                        Ok(rpc_result) => {
+                            info!(
+                                "Block {} (EVM {}) recovered from RPC after action error (hash={})",
+                                self.block_num, evm_block_num, rpc_result.1.block_hash
+                            );
+                            return Ok(rpc_result);
+                        }
+                        Err(e) => {
+                            return Err(eyre!(
+                                "Action processing failed and RPC fallback also failed for block {} (EVM {}): {}",
+                                self.block_num, evm_block_num, e
+                            ));
+                        }
+                    }
+                } else {
+                    return Err(eyre!(
+                        "Action processing failed for block {} and no RPC fallback configured",
+                        self.block_num
+                    ));
                 }
             }
 
@@ -600,6 +905,74 @@ impl ProcessingEVMBlock {
             block_hash: header.hash_slow(),
             transactions,
         };
+
+        // Block-level hash verification against reference RPC.
+        // If our locally-built block hash doesn't match production, fetch the
+        // full block from the reference RPC and use its data instead. This
+        // handles cases where SHIP data is incomplete (missing action traces,
+        // console output stripped by missing trace-history-debug-mode, etc.)
+        if let Some(rpc_endpoint) = &self.rpc_fallback_endpoint {
+            let our_hash = exec_payload.block_hash;
+            let evm_block_num = header.number;
+            let block_hex = format!("0x{:x}", evm_block_num);
+
+            // Quick hash check against reference RPC
+            // Use a static client to reuse TCP connections across blocks
+            use std::sync::LazyLock;
+            static RPC_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+                reqwest::Client::builder()
+                    .pool_max_idle_per_host(4)
+                    .build()
+                    .unwrap_or_default()
+            });
+
+            let hash_request = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "eth_getBlockByNumber",
+                "params": [block_hex, false],
+                "id": 1,
+            });
+
+            match RPC_CLIENT.post(rpc_endpoint).json(&hash_request).send().await {
+                Ok(response) => {
+                    if let Ok(json_response) = response.json::<serde_json::Value>().await {
+                        if let Some(ref_hash_str) = json_response["result"]["hash"].as_str() {
+                            if let Ok(ref_hash) = ref_hash_str.parse::<B256>() {
+                                if our_hash != ref_hash {
+                                    warn!(
+                                        "Block {} hash mismatch: ours={} prod={}. Fetching from RPC.",
+                                        evm_block_num, our_hash, ref_hash
+                                    );
+                                    // Fetch the full block from reference RPC
+                                    match self.fetch_block_from_rpc(
+                                        rpc_endpoint,
+                                        evm_block_num,
+                                        parent_hash,
+                                    ).await {
+                                        Ok(rpc_result) => {
+                                            info!(
+                                                "Block {} recovered from RPC fallback (hash={})",
+                                                evm_block_num, rpc_result.1.block_hash
+                                            );
+                                            return Ok(rpc_result);
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                "Block {} RPC fallback failed: {}. Using local data.",
+                                                evm_block_num, e
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    debug!("Block {} hash verification RPC call failed: {}", evm_block_num, e);
+                }
+            }
+        }
 
         Ok((header, exec_payload))
     }

@@ -23,6 +23,8 @@ struct Args {
     chain_id: u64,
     #[arg(long, default_value = "0000000000000000000000000000000000000000000000000000000000000000")]
     prev_hash: String,
+    #[arg(long)]
+    rpc_fallback: Option<String>,
 }
 
 #[tokio::main]
@@ -41,6 +43,7 @@ async fn main() -> eyre::Result<()> {
         raw_message_channel_size: 1000,
         block_message_channel_size: 1000,
         final_message_channel_size: 1000,
+        rpc_fallback_endpoint: args.rpc_fallback,
     };
     let (tx, mut rx) = mpsc::channel::<TelosEVMBlock>(1000);
     let handle = tokio::spawn(async move {

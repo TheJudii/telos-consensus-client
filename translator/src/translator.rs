@@ -33,6 +33,9 @@ pub struct TranslatorConfig {
     pub block_message_channel_size: usize,
     #[serde(default = "default_channel_size")]
     pub final_message_channel_size: usize,
+
+    #[serde(default)]
+    pub rpc_fallback_endpoint: Option<String>,
 }
 
 pub struct Translator {

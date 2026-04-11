@@ -69,6 +69,9 @@ pub struct AppConfig {
 
     /// Delay between retries
     pub retry_interval: Option<u64>,
+
+    /// (Optional) RPC endpoint to fallback to when SHIP console output is missing
+    pub rpc_fallback_endpoint: Option<String>,
 }
 
 impl From<&AppConfig> for TranslatorConfig {
@@ -85,6 +88,7 @@ impl From<&AppConfig> for TranslatorConfig {
             raw_message_channel_size: 1000,
             block_message_channel_size: 1000,
             final_message_channel_size: 1000,
+            rpc_fallback_endpoint: config.rpc_fallback_endpoint.clone(),
         }
     }
 }

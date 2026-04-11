@@ -33,7 +33,8 @@ lazy_static! {
 
         raw_message_channel_size: default_channel_size(),
         block_message_channel_size: default_channel_size(),
-        final_message_channel_size: default_channel_size()
+        final_message_channel_size: default_channel_size(),
+        rpc_fallback_endpoint: None,
     };
     pub static ref MAINNET_DEPLOY_CONFIG: TranslatorConfig = TranslatorConfig {
         chain_id: 40.into(),
@@ -52,7 +53,8 @@ lazy_static! {
 
         raw_message_channel_size: default_channel_size(),
         block_message_channel_size: default_channel_size(),
-        final_message_channel_size: default_channel_size()
+        final_message_channel_size: default_channel_size(),
+        rpc_fallback_endpoint: None,
     };
     pub static ref TESTNET_GENESIS_CONFIG: TranslatorConfig = TranslatorConfig {
         chain_id: 41.into(),
@@ -71,7 +73,8 @@ lazy_static! {
 
         raw_message_channel_size: default_channel_size(),
         block_message_channel_size: default_channel_size(),
-        final_message_channel_size: default_channel_size()
+        final_message_channel_size: default_channel_size(),
+        rpc_fallback_endpoint: None,
     };
     // pub static ref TESTNET_DEPLOY_CONFIG: TranslatorConfig = TranslatorConfig {
     //     chain_id: 41.into(),

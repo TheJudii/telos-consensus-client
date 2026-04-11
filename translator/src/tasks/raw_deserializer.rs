@@ -86,6 +86,18 @@ pub async fn raw_deserializer(
                     // Skip if current evm block <= evm deploy
                     let skip_events = (b.block_num - config.chain_id.block_delta())
                         <= config.evm_deploy_block.unwrap_or_default();
+
+                    // Extract block timestamp from the signed block if available
+                    let block_timestamp = r.block.as_ref()
+                        .and_then(|block_data| {
+                            // Try to decode SignedBlock to get timestamp
+                            use antelope::chain::Packer;
+                            let mut sb = crate::types::ship_types::SignedBlock::default();
+                            sb.unpack(block_data);
+                            Some(sb.header.header.timestamp as u64)
+                        })
+                        .unwrap_or(0u64);
+
                     let block = ProcessingEVMBlock::new(ProcessingEVMBlockArgs {
                         chain_id: config.chain_id.0,
                         block_num: b.block_num,
@@ -95,6 +107,8 @@ pub async fn raw_deserializer(
                         lib_hash: r.last_irreversible.block_id,
                         result: r.clone(),
                         skip_events,
+                        rpc_fallback_endpoint: config.rpc_fallback_endpoint.clone(),
+                        block_timestamp,
                     });
                     debug!("Block #{} sending to block deserializer...", b.block_num);
                     block_deserializer_tx.send(block).await?;
