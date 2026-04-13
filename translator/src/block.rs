@@ -911,9 +911,20 @@ impl ProcessingEVMBlock {
         // full block from the reference RPC and use its data instead. This
         // handles cases where SHIP data is incomplete (missing action traces,
         // console output stripped by missing trace-history-debug-mode, etc.)
+        //
+        // To maximize sync speed, we only verify blocks that have transactions
+        // OR every 10th block as a safety sample. The tx-level and action-error
+        // fallbacks cover most cases already; this is the final safety net.
         if let Some(rpc_endpoint) = &self.rpc_fallback_endpoint {
             let our_hash = exec_payload.block_hash;
             let evm_block_num = header.number;
+            let has_transactions = !self.transactions.is_empty();
+            let is_sample_block = evm_block_num % 10 == 0;
+
+            if !has_transactions && !is_sample_block {
+                return Ok((header, exec_payload));
+            }
+
             let block_hex = format!("0x{:x}", evm_block_num);
 
             // Quick hash check against reference RPC
