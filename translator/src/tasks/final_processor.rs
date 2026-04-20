@@ -189,7 +189,13 @@ pub async fn final_processor(
         };
 
         if evm_block_num > config.evm_deploy_block.unwrap_or_default() {
-            let mut statediff_error = false;
+            // Track per-block drops (only AccountState entries whose scope we
+            // cannot resolve to an address). DecodedRow::Account carries the
+            // address directly and never needs cache resolution, so those are
+            // always persisted. An unresolved scope means we cannot identify
+            // the contract whose storage slot changed, so we drop only that
+            // individual storage-slot entry — NOT the whole block's state.
+            let mut dropped_accountstate: u32 = 0;
 
             for row in &block.decoded_rows {
                 match row {
@@ -214,29 +220,28 @@ pub async fn final_processor(
                                 });
                             }
                             Err(e) => {
-                                warn!(
-                                    "Block {} (EVM {}): failed to resolve account state scope {}: {}. \
-                                     Skipping state diffs for this block (trust_consensus mode).",
+                                debug!(
+                                    "Block {} (EVM {}): dropped AccountState for unresolvable scope {}: {}",
                                     block_num, evm_block_num, scope.n, e
                                 );
-                                statediff_error = true;
-                                break;
+                                dropped_accountstate += 1;
                             }
                         }
                     }
                     _ => (),
                 }
-                if statediff_error {
-                    break;
-                }
             }
 
-            // If state diff resolution failed, clear partial state diffs
-            // but still send the block. With trust_consensus=true, reth
-            // accepts the block without re-executing state transitions.
-            if statediff_error {
-                statediffs_account.clear();
-                statediffs_accountstate.clear();
+            if dropped_accountstate > 0 {
+                warn!(
+                    "Block {} (EVM {}): dropped {} AccountState entries whose scope could not be \
+                     resolved; kept {} Account and {} AccountState entries.",
+                    block_num,
+                    evm_block_num,
+                    dropped_accountstate,
+                    statediffs_account.len(),
+                    statediffs_accountstate.len()
+                );
             }
 
             for new_wallet in &block.new_wallets {

@@ -108,6 +108,7 @@ pub async fn raw_deserializer(
                         result: r.clone(),
                         skip_events,
                         rpc_fallback_endpoint: config.rpc_fallback_endpoint.clone(),
+                        rpc_fallback_sample_every_n: config.rpc_fallback_sample_every_n,
                         block_timestamp,
                     });
                     debug!("Block #{} sending to block deserializer...", b.block_num);

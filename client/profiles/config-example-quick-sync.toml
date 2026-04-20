@@ -1,0 +1,43 @@
+# Telos Consensus Client - QUICK-SYNC profile template.
+#
+# DO NOT USE IN PRODUCTION. This profile is optimized for fast
+# initial catch-up and development. It samples only 1-in-10 empty
+# blocks against the reference RPC (rpc_fallback_sample_every_n = 10),
+# trading ~10x throughput for reduced safety margin on empty blocks.
+#
+# Blocks WITH transactions are always fully validated regardless
+# of sampling rate, so this profile is safe for EVM activity
+# correctness; it only weakens empty-block validation.
+#
+# Typical use:
+#   1. Point at quick-sync config while catching up historical blocks
+#   2. Switch to config-example-production.toml once at tip
+#   3. Run scripts/verify_sweep.py against canonical before promotion
+
+log_level = "info"
+chain_id = 41
+
+evm_start_block = 0
+prev_hash = "0x0000000000000000000000000000000000000000000000000000000000000000"
+
+execution_endpoint = "http://localhost:8551"
+jwt_secret = "REPLACE_WITH_REAL_JWT_SECRET"
+
+ship_endpoint = "ws://localhost:18081"
+chain_endpoint = "http://localhost:18888"
+
+batch_size = 10000
+
+data_path = "/data/telos-consensus-client/quick-sync/db"
+block_checkpoint_interval = 5000
+maximum_sync_range = 500000000
+latest_blocks_in_db_num = 1800
+
+rpc_fallback_endpoint = "https://rpc.testnet.telos.net"
+
+# QUICK-SYNC SAMPLING: sample 1 in 10 empty blocks. Faster, less safe.
+rpc_fallback_sample_every_n = 10
+
+raw_message_channel_size = 5000
+block_message_channel_size = 5000
+final_message_channel_size = 5000

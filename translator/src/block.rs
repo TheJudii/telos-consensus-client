@@ -129,6 +129,7 @@ pub struct ProcessingEVMBlock {
     pub lib_hash: Checksum256,
     pub skip_events: bool,
     rpc_fallback_endpoint: Option<String>,
+    rpc_fallback_sample_every_n: u32,
     block_timestamp: u64,
 }
 
@@ -183,6 +184,7 @@ pub struct ProcessingEVMBlockArgs {
     pub result: GetBlocksResultV0,
     pub skip_events: bool,
     pub rpc_fallback_endpoint: Option<String>,
+    pub rpc_fallback_sample_every_n: u32,
     pub block_timestamp: u64,
 }
 
@@ -198,6 +200,7 @@ impl ProcessingEVMBlock {
             result,
             skip_events,
             rpc_fallback_endpoint,
+            rpc_fallback_sample_every_n,
             block_timestamp,
         } = args;
 
@@ -222,6 +225,7 @@ impl ProcessingEVMBlock {
             new_revision: None,
             new_wallets: vec![],
             rpc_fallback_endpoint,
+            rpc_fallback_sample_every_n,
             block_timestamp,
         }
     }
@@ -918,9 +922,19 @@ impl ProcessingEVMBlock {
         if let Some(rpc_endpoint) = &self.rpc_fallback_endpoint {
             let our_hash = exec_payload.block_hash;
             let evm_block_num = header.number;
+            // Apr 2026 re-enable: the Path 1 disable was based on a wrong
+            // hypothesis (translator producing bad empty-block hashes).
+            // Instrumentation proved the translator + RPC fallback were
+            // correct; the crash loop was a reth CanonicalHeaders index
+            // inconsistency at one block, handled by consensus client's
+            // check_range by-hash fallthrough.
+            // Sampling rate is config-driven. n=1 means every block is validated
+            // (safe production default); n=10 means 1-in-10 empty blocks are sampled
+            // (quick-sync profile). Blocks with transactions are ALWAYS validated
+            // regardless of sampling, because tx-level fallbacks depend on it.
+            let sample_every_n = self.rpc_fallback_sample_every_n.max(1) as u64;
             let has_transactions = !self.transactions.is_empty();
-            let is_sample_block = evm_block_num % 10 == 0;
-
+            let is_sample_block = sample_every_n <= 1 || evm_block_num % sample_every_n == 0;
             if !has_transactions && !is_sample_block {
                 return Ok((header, exec_payload));
             }

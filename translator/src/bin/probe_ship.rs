@@ -44,6 +44,7 @@ async fn main() -> eyre::Result<()> {
         block_message_channel_size: 1000,
         final_message_channel_size: 1000,
         rpc_fallback_endpoint: args.rpc_fallback,
+        rpc_fallback_sample_every_n: 1,
     };
     let (tx, mut rx) = mpsc::channel::<TelosEVMBlock>(1000);
     let handle = tokio::spawn(async move {
