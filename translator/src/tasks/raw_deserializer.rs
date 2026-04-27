@@ -72,7 +72,7 @@ pub async fn raw_deserializer(
                         .unwrap_or(u32::MAX),
                     max_messages_in_flight: 10000,
                     have_positions: vec![],
-                    irreversible_only: false, // TODO: Fork handling
+                    irreversible_only: true, // #71: prevent microfork capture by only consuming finalized blocks (~3min LIB lag)
                     fetch_block: true,
                     fetch_traces: true,
                     fetch_deltas: true,
