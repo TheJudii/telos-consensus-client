@@ -23,7 +23,7 @@ use reth_primitives::ReceiptWithBloom;
 use reth_telos_rpc_engine_api::structs::TelosEngineAPIExtraFields;
 use reth_trie_common::root::ordered_trie_root_with_encoder;
 use std::cmp::{max, Ordering};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use tracing::{debug, warn, info};
 
 const MINIMUM_FEE_PER_GAS: u128 = 7;
@@ -131,6 +131,12 @@ pub struct ProcessingEVMBlock {
     rpc_fallback_endpoint: Option<String>,
     rpc_fallback_sample_every_n: u32,
     block_timestamp: u64,
+    /// Count of tx-bearing eosio.evm actions observed during handle_action.
+    /// Used to gate the RPC-validation skip path: skip only when this is 0
+    /// (genuine-empty evidence), not when self.transactions is empty
+    /// (which can falsely mean "we dropped them silently"). See block.rs
+    /// commentary around the skip path for full rationale.
+    pub tx_actions_seen: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -227,6 +233,7 @@ impl ProcessingEVMBlock {
             rpc_fallback_endpoint,
             rpc_fallback_sample_every_n,
             block_timestamp,
+            tx_actions_seen: 0,
         }
     }
 
@@ -350,6 +357,17 @@ impl ProcessingEVMBlock {
         let action_account = action.action_account();
         let action_receiver = action.receiver();
 
+        // Evidence counter for tx-bearing actions. Increment BEFORE any parse
+        // step so that a silent parse failure downstream doesn't also silently
+        // zero-out our evidence. Used to gate RPC-validation skip below.
+        if action_account == EOSIO_EVM
+            && (action_name == RAW
+                || action_name == WITHDRAW
+                || action_name == TRANSFER)
+        {
+            self.tx_actions_seen = self.tx_actions_seen.saturating_add(1);
+        }
+
         if action_account == EOSIO_EVM && action_name == INIT {
             let config_delta_row = self
                 .find_config_row()
@@ -397,14 +415,27 @@ impl ProcessingEVMBlock {
                                 )
                             }
                             Ok(None) => {
-                                // Transaction doesn't exist on the reference chain.
-                                // This means prod also skipped it (no console receipt,
-                                // no on-chain tx). Skip to match prod behavior.
-                                debug!(
-                                    "RPC returned null for tx {} in block {} — skipping (matches prod)",
+                                // DO NOT silently skip. Earlier versions assumed
+                                // "RPC returned null => prod skipped it" but this
+                                // is wrong in the face of RPC replica lag or eventual
+                                // consistency (observed on mainnet-quick at block
+                                // 463,899,714: tx 0x53e1e7cf returned null during
+                                // initial sync but exists on-chain). Silent skip
+                                // produces an empty-block hash that diverges from
+                                // canonical and gets committed to reth without
+                                // verification when the block happens to not be
+                                // a sample block. Fail loud instead — the outer
+                                // handler at block.rs ~790 will catch this as an
+                                // action-processing error and fall back to
+                                // whole-block RPC fetch.
+                                warn!(
+                                    "Single-tx receipt RPC returned null for tx {} in                                      block {}. Promoting to block-level fallback.",
                                     tx_hash_str, self.block_num
                                 );
-                                return Ok(());
+                                return Err(eyre::eyre!(
+                                    "Single-tx receipt null for tx {} in block {}                                      (likely RPC replica lag); triggering block-level fallback",
+                                    tx_hash_str, self.block_num
+                                ));
                             }
                             Err(e) => {
                                 warn!(
@@ -696,7 +727,7 @@ impl ProcessingEVMBlock {
 
         let row_deltas = self.contract_rows.clone().unwrap_or_default();
 
-        let mut deduped_accstate_deltas = HashMap::new();
+        let mut deduped_accstate_deltas = BTreeMap::new();
 
         if !self.skip_events {
             for delta in row_deltas {
@@ -933,9 +964,26 @@ impl ProcessingEVMBlock {
             // (quick-sync profile). Blocks with transactions are ALWAYS validated
             // regardless of sampling, because tx-level fallbacks depend on it.
             let sample_every_n = self.rpc_fallback_sample_every_n.max(1) as u64;
+            // Evidence-based skip: only consider the block "genuinely empty"
+            // (and therefore skip-validation-eligible) if we positively observed
+            // zero tx-bearing actions during parsing. self.transactions.is_empty()
+            // alone is NOT sufficient evidence — it's also what we'd see if
+            // parsing silently dropped txs. See mainnet-quick incident:
+            // block 463,899,714 had 1 canonical tx, translator silently dropped
+            // it on null RPC receipt, output was empty, old logic skipped
+            // validation, reth committed the wrong hash permanently.
+            let had_no_tx_actions = self.tx_actions_seen == 0;
             let has_transactions = !self.transactions.is_empty();
             let is_sample_block = sample_every_n <= 1 || evm_block_num % sample_every_n == 0;
-            if !has_transactions && !is_sample_block {
+            // Defensive cross-check: if we saw tx actions but produced no output
+            // txs, that's a silent drop. Log loudly before forcing validation.
+            if !has_transactions && !had_no_tx_actions {
+                warn!(
+                    "Block {}: observed {} tx-bearing actions but produced 0 output txs.                      Forcing RPC validation (silent-drop suspected).",
+                    evm_block_num, self.tx_actions_seen
+                );
+            }
+            if had_no_tx_actions && !is_sample_block {
                 return Ok((header, exec_payload));
             }
 
