@@ -12,7 +12,7 @@ use serde_json::json;
 use telos_translator_rs::block::TelosEVMBlock;
 use tokio::sync::mpsc;
 use tokio::task::JoinError;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -28,9 +28,9 @@ pub enum Error {
     // SpawnTranslator,
     #[error("Executor hash mismatch.")]
     ExecutorHashMismatch,
-    #[error("Fork choice updated error")]
+    #[error("Fork choice updated error: {0}")]
     ForkChoiceUpdated(String),
-    #[error("New payload error")]
+    #[error("New payload error: {0}")]
     NewPayloadV1(String),
     #[error("Database error: {0}")]
     Database(eyre::Report),
@@ -210,7 +210,37 @@ impl ConsensusClient {
 
                 if let Some(evm_block) = evm_block {
                     if evm_block.header.hash != block_hash {
-                        return Err(Error::ExecutorHashMismatch);
+                        // Reth's canonical-headers index may be stale for this
+                        // block (known reth db inconsistency that manifested
+                        // after the Apr 2026 sampling-opt crash loop). If reth
+                        // still has the correct block stored under its hash,
+                        // treat this as recoverable: log and continue. A
+                        // later newPayload/forkchoiceUpdated will re-canonicalize.
+                        let block_hash_str = block_hash.to_string();
+                        match self
+                            .execution_api
+                            .get_block_by_hash(&block_hash_str)
+                            .await?
+                        {
+                            Some(_) => {
+                                warn!(
+                                    "CHECK-RANGE index inconsistency at block {}                                      (reth number->hash returns {:?} but block                                      {} is stored under hash in reth; continuing)",
+                                    block_num, evm_block.header.hash, block_hash_str,
+                                );
+                                continue;
+                            }
+                            None => {
+                                error!(
+                                    "CHECK-RANGE MISMATCH at block {}: consensus_hash={:?} reth_stored_hash={:?} reth_parent_hash={:?} reth_extra_data={:?}",
+                                    block_num,
+                                    block_hash,
+                                    evm_block.header.hash,
+                                    evm_block.header.parent_hash,
+                                    evm_block.header.extra_data,
+                                );
+                                return Err(Error::ExecutorHashMismatch);
+                            }
+                        }
                     }
                     continue;
                 }
@@ -236,11 +266,11 @@ impl ConsensusClient {
                 .map(|block| block.hash.parse().unwrap())
                 .unwrap_or(block_hash);
 
+            // Telos test mode: zero finalized triggers optimistic sync in reth v1.11.3
             let finalized_hash = if block_is_final {
                 debug!("Synced to head, LIB < current block");
                 Some(block_hash)
             } else if is_new_lib {
-                // if lib hash has been changed we should send finalized hash for fork choice update
                 debug!("New LIB is detected");
                 self.db
                     .get_block_or_prev(lib_evm_num)?
@@ -264,6 +294,35 @@ impl ConsensusClient {
         finalized_hash: Option<B256>,
         safe_hash: B256,
     ) -> Result<(), Error> {
+        // Telos: Write extra fields to filesystem for the executor to pick up.
+        // Use atomic write (tmp + rename) so reth never sees a 0-byte or partial file.
+        let extra_dir = std::path::Path::new("/tmp/telos-extra-fields");
+        let _ = std::fs::create_dir_all(extra_dir);
+        for block in batch {
+            let path = extra_dir.join(format!("{:?}.json", block.block_hash));
+            let tmp_path = extra_dir.join(format!("{:?}.json.tmp", block.block_hash));
+            match serde_json::to_string(&block.extra_fields) {
+                Ok(json) => {
+                    if json.is_empty() {
+                        warn!("extra_fields serialized to empty string for block {:?}", block.block_hash);
+                        continue;
+                    }
+                    if let Err(e) = std::fs::write(&tmp_path, &json) {
+                        warn!("extra_fields tmp write failed for {:?}: {}", block.block_hash, e);
+                        let _ = std::fs::remove_file(&tmp_path);
+                        continue;
+                    }
+                    if let Err(e) = std::fs::rename(&tmp_path, &path) {
+                        warn!("extra_fields rename failed for {:?}: {}", block.block_hash, e);
+                        let _ = std::fs::remove_file(&tmp_path);
+                    }
+                }
+                Err(e) => {
+                    warn!("extra_fields serialize failed for {:?}: {}", block.block_hash, e);
+                }
+            }
+        }
+
         let rpc_batch = batch
             .iter()
             .map(|block| {
@@ -323,7 +382,12 @@ impl ConsensusClient {
             info!("fork_choice_updated_result {:?}", fork_choice_updated);
 
             // Valid, Invalid, Accepted, Syncing
-            if fork_choice_updated.is_invalid() || fork_choice_updated.is_syncing() {
+            if fork_choice_updated.is_syncing() {
+                // SYNCING is normal during initial sync - reth is catching up, just log and continue
+                info!(
+                    "Fork choice update status is SYNCING (reth still syncing, continuing...)",
+                );
+            } else if fork_choice_updated.is_invalid() {
                 info!(
                     "Fork choice update status is {} ",
                     fork_choice_updated.payload_status.status

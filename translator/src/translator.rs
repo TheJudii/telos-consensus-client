@@ -15,6 +15,15 @@ pub fn default_channel_size() -> usize {
     1000
 }
 
+/// Default sampling rate for RPC fallback hash verification.
+/// A value of 1 means every block is validated against the reference RPC
+/// (safe production default). Higher values (e.g. 10) validate every Nth
+/// block only, trading safety for sync throughput. Only applies to empty
+/// blocks; blocks with transactions are always validated.
+pub fn default_rpc_fallback_sample_every_n() -> u32 {
+    1
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranslatorConfig {
     pub chain_id: ChainId,
@@ -33,6 +42,16 @@ pub struct TranslatorConfig {
     pub block_message_channel_size: usize,
     #[serde(default = "default_channel_size")]
     pub final_message_channel_size: usize,
+
+    #[serde(default)]
+    pub rpc_fallback_endpoint: Option<String>,
+
+    /// Validate every Nth empty block against the reference RPC.
+    /// 1 = validate every block (safe production default).
+    /// 10 = validate every 10th block (quick-sync; faster but accepts
+    /// 90% of empty blocks on trust). Ignored for blocks with transactions.
+    #[serde(default = "default_rpc_fallback_sample_every_n")]
+    pub rpc_fallback_sample_every_n: u32,
 }
 
 pub struct Translator {

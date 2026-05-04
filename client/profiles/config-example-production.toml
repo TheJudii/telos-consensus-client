@@ -1,0 +1,52 @@
+# Telos Consensus Client - PRODUCTION profile template.
+#
+# Safety posture: every block is validated against the reference RPC
+# (rpc_fallback_sample_every_n = 1). This is the recommended default
+# for any node that serves public traffic or advances canonical state.
+#
+# Compared to the quick-sync profile (rpc_fallback_sample_every_n = 10):
+#   - ~10x slower on empty-block-heavy ranges (initial historical sync)
+#   - catches ANY translator / SHIP-data divergence on the spot
+#   - produces no block that the reference RPC disagrees with
+#
+# For initial-sync-from-genesis, operators may temporarily run with
+# sample_every_n = 10 and then restart with sample_every_n = 1 once
+# caught up to the tip. A dedicated one-shot verification sweep
+# (scripts/verify_sweep.py) against canonical should be run before
+# any production promotion regardless of sync profile used.
+
+log_level = "info"
+chain_id = 41  # testnet; set 40 for mainnet
+
+# Chain-specific entry point. Use a historical checkpoint or genesis.
+evm_start_block = 0
+prev_hash = "0x0000000000000000000000000000000000000000000000000000000000000000"
+# evm_deploy_block = 137430500  # testnet EVM deploy block
+
+# Local execution layer (reth)
+execution_endpoint = "http://localhost:8551"
+jwt_secret = "REPLACE_WITH_REAL_JWT_SECRET"
+
+# Antelope sources
+ship_endpoint = "ws://localhost:18081"
+chain_endpoint = "http://localhost:18888"
+
+# Engine-API batch flush cadence
+batch_size = 10000
+
+# Local DB
+data_path = "/data/telos-consensus-client/production/db"
+block_checkpoint_interval = 5000
+maximum_sync_range = 500000000
+latest_blocks_in_db_num = 10000
+
+# Reference RPC for fallback + sampling validation
+rpc_fallback_endpoint = "https://rpc.testnet.telos.net"
+
+# PRODUCTION-SAFE SAMPLING: validate every block.
+rpc_fallback_sample_every_n = 1
+
+# Channel sizing
+raw_message_channel_size = 5000
+block_message_channel_size = 5000
+final_message_channel_size = 5000

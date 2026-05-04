@@ -13,6 +13,8 @@ pub struct JsonRequestBody<'a> {
 pub struct JsonError {
     pub code: i64,
     pub message: String,
+    #[serde(default)]
+    pub data: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

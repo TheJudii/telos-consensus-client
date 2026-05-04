@@ -69,6 +69,17 @@ pub struct AppConfig {
 
     /// Delay between retries
     pub retry_interval: Option<u64>,
+
+    /// (Optional) RPC endpoint to fallback to when SHIP console output is missing
+    pub rpc_fallback_endpoint: Option<String>,
+
+    /// Validate every Nth empty block against the reference RPC.
+    /// Defaults to 1 (validate every block; safe production default).
+    /// Set to 10 in quick-sync profile for 10x speed at the cost of
+    /// accepting 90% of empty blocks on trust. Blocks with transactions
+    /// are always validated.
+    #[serde(default)]
+    pub rpc_fallback_sample_every_n: Option<u32>,
 }
 
 impl From<&AppConfig> for TranslatorConfig {
@@ -85,6 +96,8 @@ impl From<&AppConfig> for TranslatorConfig {
             raw_message_channel_size: 1000,
             block_message_channel_size: 1000,
             final_message_channel_size: 1000,
+            rpc_fallback_endpoint: config.rpc_fallback_endpoint.clone(),
+            rpc_fallback_sample_every_n: config.rpc_fallback_sample_every_n.unwrap_or(1),
         }
     }
 }

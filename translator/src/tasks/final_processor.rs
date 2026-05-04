@@ -17,7 +17,7 @@ use reth_telos_rpc_engine_api::structs::{
 use std::collections::HashMap;
 use std::str::FromStr;
 use tokio::{sync::mpsc, time::Instant};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 struct BlockMap {
     parent_hash: B256,
@@ -189,11 +189,19 @@ pub async fn final_processor(
         };
 
         if evm_block_num > config.evm_deploy_block.unwrap_or_default() {
-            for row in block.decoded_rows {
+            // Track per-block drops (only AccountState entries whose scope we
+            // cannot resolve to an address). DecodedRow::Account carries the
+            // address directly and never needs cache resolution, so those are
+            // always persisted. An unresolved scope means we cannot identify
+            // the contract whose storage slot changed, so we drop only that
+            // individual storage-slot entry — NOT the whole block's state.
+            let mut dropped_accountstate: u32 = 0;
+
+            for row in &block.decoded_rows {
                 match row {
                     DecodedRow::Account(removed, acc_diff) => {
                         statediffs_account.push(TelosAccountTableRow {
-                            removed,
+                            removed: *removed,
                             address: Address::from_slice(&acc_diff.address.data),
                             account: acc_diff.account.to_string(),
                             nonce: acc_diff.nonce,
@@ -202,33 +210,61 @@ pub async fn final_processor(
                         })
                     }
                     DecodedRow::AccountState(removed, acc_state_diff, scope) => {
-                        statediffs_accountstate.push(TelosAccountStateTableRow {
-                            removed,
-                            address: native_to_evm_cache.get_index(scope.n).await?,
-                            key: U256::from_be_slice(&acc_state_diff.key.data),
-                            value: U256::from_be_slice(&acc_state_diff.value.data),
-                        });
+                        match native_to_evm_cache.get_index(scope.n).await {
+                            Ok(address) => {
+                                statediffs_accountstate.push(TelosAccountStateTableRow {
+                                    removed: *removed,
+                                    address,
+                                    key: U256::from_be_slice(&acc_state_diff.key.data),
+                                    value: U256::from_be_slice(&acc_state_diff.value.data),
+                                });
+                            }
+                            Err(e) => {
+                                debug!(
+                                    "Block {} (EVM {}): dropped AccountState for unresolvable scope {}: {}",
+                                    block_num, evm_block_num, scope.n, e
+                                );
+                                dropped_accountstate += 1;
+                            }
+                        }
                     }
                     _ => (),
                 }
             }
 
-            for new_wallet in block.new_wallets {
+            if dropped_accountstate > 0 {
+                warn!(
+                    "Block {} (EVM {}): dropped {} AccountState entries whose scope could not be \
+                     resolved; kept {} Account and {} AccountState entries.",
+                    block_num,
+                    evm_block_num,
+                    dropped_accountstate,
+                    statediffs_account.len(),
+                    statediffs_accountstate.len()
+                );
+            }
+
+            for new_wallet in &block.new_wallets {
                 match new_wallet {
                     WalletEvents::CreateWallet(trx_index, create_action) => {
-                        new_addresses_using_create.push((
-                            trx_index as u64,
-                            U256::from_be_slice(
-                                native_to_evm_cache
-                                    .get(create_action.account.value())
-                                    .await?
-                                    .as_slice(),
-                            ),
-                        ))
+                        match native_to_evm_cache.get(create_action.account.value()).await {
+                            Ok(address) => {
+                                new_addresses_using_create.push((
+                                    *trx_index as u64,
+                                    U256::from_be_slice(address.as_slice()),
+                                ));
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "Block {} (EVM {}): failed to resolve create wallet account: {}. Skipping.",
+                                    block_num, evm_block_num, e
+                                );
+                            }
+                        }
                     }
                     WalletEvents::OpenWallet(trx_index, openwallet_action) => {
                         new_addresses_using_openwallet.push((
-                            trx_index as u64,
+                            *trx_index as u64,
                             U256::from_be_slice(&openwallet_action.address.data),
                         ))
                     }
@@ -248,8 +284,8 @@ pub async fn final_processor(
             completed_block.extra_fields = TelosEngineAPIExtraFields {
                 statediffs_account: Some(statediffs_account),
                 statediffs_accountstate: Some(statediffs_accountstate),
-                revision_changes: block.new_revision,
-                gasprice_changes: block.new_gas_price,
+                revision_changes: block.new_revision.clone(),
+                gasprice_changes: block.new_gas_price.clone(),
                 new_addresses_using_create: Some(new_addresses_using_create),
                 new_addresses_using_openwallet: Some(new_addresses_using_openwallet),
                 receipts,

@@ -190,15 +190,124 @@ impl PrintedReceipt {
             if let Some(end) = console[start_index..].find(end_pattern) {
                 let end_index = start_index + end;
                 let extracted = &console[start_index..end_index];
-                let printed_receipt = serde_json::from_str::<PrintedReceipt>(extracted).unwrap();
-                Some(printed_receipt)
+                match serde_json::from_str::<PrintedReceipt>(extracted) {
+                    Ok(printed_receipt) => Some(printed_receipt),
+                    Err(e) => {
+                        warn!("Failed to parse PrintedReceipt JSON: {} (payload: {})", e, extracted);
+                        None
+                    }
+                }
             } else {
-                warn!("End pattern not found.");
+                warn!("End pattern not found in console output.");
                 None
             }
         } else {
-            warn!("Start pattern not found.");
+            // This branch is hit for both genuinely empty consoles and for
+            // consoles that contain binary data that resolved to text without
+            // the expected RCPT{{...}}RCPT marker. The caller should decide
+            // whether to hard-fail or skip.
+            warn!("Start pattern not found in console output (console_len={}).", console.len());
             None
         }
+    }
+
+    pub fn from_rpc_receipt(
+        rpc_receipt: &RpcReceipt,
+        trx_index: u16,
+        block_num: u64,
+        block_timestamp: u64,
+    ) -> Self {
+        let status = if rpc_receipt.status.unwrap_or(false) { 1u8 } else { 0u8 };
+        let gasused = format!("{:x}", rpc_receipt.gas_used.unwrap_or(0u128));
+        let createdaddr = rpc_receipt
+            .contract_address
+            .map(|addr| format!("{:x}", addr))
+            .unwrap_or_default();
+
+        PrintedReceipt {
+            charged_gas: gasused.clone(),
+            trx_index,
+            block: block_num,
+            status,
+            epoch: block_timestamp,
+            createdaddr,
+            gasused,
+            logs: rpc_receipt.logs.clone().unwrap_or_default(),
+            output: "".to_string(),
+            errors: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RpcReceipt {
+    #[serde(rename = "transactionHash")]
+    pub transaction_hash: Option<String>,
+    #[serde(rename = "blockNumber")]
+    pub block_number: Option<String>,
+    #[serde(rename = "gasUsed", deserialize_with = "deserialize_gas_used")]
+    pub gas_used: Option<u128>,
+    #[serde(deserialize_with = "deserialize_status")]
+    pub status: Option<bool>,
+    #[serde(rename = "contractAddress")]
+    pub contract_address: Option<Address>,
+    pub logs: Option<Vec<Log>>,
+}
+
+fn deserialize_gas_used<'de, D>(deserializer: D) -> Result<Option<u128>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::Error;
+    use serde_json::Value;
+
+    let val = Option::<Value>::deserialize(deserializer)?;
+    match val {
+        None => Ok(None),
+        Some(Value::String(s)) => {
+            // Parse hex string like "0xe1e88"
+            if s.starts_with("0x") {
+                u128::from_str_radix(&s[2..], 16).map(Some).map_err(D::Error::custom)
+            } else {
+                s.parse::<u128>().map(Some).map_err(D::Error::custom)
+            }
+        }
+        Some(Value::Number(n)) => {
+            n.as_u64()
+                .map(|u| Some(u as u128))
+                .ok_or_else(|| D::Error::custom("invalid gas_used number"))
+        }
+        Some(_) => Err(D::Error::custom("gas_used must be a string or number")),
+    }
+}
+
+fn deserialize_status<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::Error;
+    use serde_json::Value;
+
+    let val = Option::<Value>::deserialize(deserializer)?;
+    match val {
+        None => Ok(None),
+        Some(Value::String(s)) => {
+            // Parse hex string like "0x1" or "0x0"
+            if s.starts_with("0x") {
+                let num = u8::from_str_radix(&s[2..], 16).map_err(D::Error::custom)?;
+                Ok(Some(num != 0))
+            } else {
+                s.parse::<u8>()
+                    .map(|n| Some(n != 0))
+                    .map_err(D::Error::custom)
+            }
+        }
+        Some(Value::Number(n)) => {
+            n.as_u64()
+                .map(|u| Some(u != 0))
+                .ok_or_else(|| D::Error::custom("invalid status number"))
+        }
+        Some(Value::Bool(b)) => Ok(Some(b)),
+        Some(_) => Err(D::Error::custom("status must be a string, number, or boolean")),
     }
 }

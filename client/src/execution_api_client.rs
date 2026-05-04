@@ -33,7 +33,7 @@ impl fmt::Display for JsonErrors {
         let Self(errors) = self;
         let errors = errors
             .iter()
-            .map(|(id, error)| format!("({id}, {}", error.message))
+            .map(|(id, error)| format!("({id}, {} data={:?})", error.message, error.data))
             .collect::<Vec<String>>()
             .join(", ");
         write!(f, "{errors}")
@@ -64,6 +64,7 @@ impl Display for BlockStatus {
 #[derive(Debug)]
 pub enum ExecutionApiMethod {
     BlockByNumber,
+    BlockByHash,
     NewPayloadV1,
     ForkChoiceUpdatedV1,
 }
@@ -72,6 +73,7 @@ impl Display for ExecutionApiMethod {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ExecutionApiMethod::BlockByNumber => write!(f, "eth_getBlockByNumber"),
+            ExecutionApiMethod::BlockByHash => write!(f, "eth_getBlockByHash"),
             ExecutionApiMethod::NewPayloadV1 => write!(f, "engine_newPayloadV1"),
             ExecutionApiMethod::ForkChoiceUpdatedV1 => write!(f, "engine_forkchoiceUpdatedV1"),
         }
@@ -187,6 +189,27 @@ impl ExecutionApiClient {
         let request = RpcRequest {
             method: ExecutionApiMethod::BlockByNumber,
             params: json!([format!("0x{:x}", block_number), true]),
+        };
+        let result = self.rpc(request).await?.result;
+
+        if result.is_null() {
+            return Ok(None);
+        }
+
+        serde_json::from_value(result)
+            .map_err(|_| ExecutionApiError::CannotDeserialize)
+            .map(Some)
+    }
+
+    /// Gets a block by its hash (returns Some if reth has the block under any
+    /// chain, canonical or side-chain).
+    pub async fn get_block_by_hash(
+        &self,
+        block_hash: &str,
+    ) -> Result<Option<Block>, ExecutionApiError> {
+        let request = RpcRequest {
+            method: ExecutionApiMethod::BlockByHash,
+            params: json!([block_hash, true]),
         };
         let result = self.rpc(request).await?.result;
 
