@@ -210,37 +210,15 @@ impl ConsensusClient {
 
                 if let Some(evm_block) = evm_block {
                     if evm_block.header.hash != block_hash {
-                        // Reth's canonical-headers index may be stale for this
-                        // block (known reth db inconsistency that manifested
-                        // after the Apr 2026 sampling-opt crash loop). If reth
-                        // still has the correct block stored under its hash,
-                        // treat this as recoverable: log and continue. A
-                        // later newPayload/forkchoiceUpdated will re-canonicalize.
-                        let block_hash_str = block_hash.to_string();
-                        match self
-                            .execution_api
-                            .get_block_by_hash(&block_hash_str)
-                            .await?
-                        {
-                            Some(_) => {
-                                warn!(
-                                    "CHECK-RANGE index inconsistency at block {}                                      (reth number->hash returns {:?} but block                                      {} is stored under hash in reth; continuing)",
-                                    block_num, evm_block.header.hash, block_hash_str,
-                                );
-                                continue;
-                            }
-                            None => {
-                                error!(
-                                    "CHECK-RANGE MISMATCH at block {}: consensus_hash={:?} reth_stored_hash={:?} reth_parent_hash={:?} reth_extra_data={:?}",
-                                    block_num,
-                                    block_hash,
-                                    evm_block.header.hash,
-                                    evm_block.header.parent_hash,
-                                    evm_block.header.extra_data,
-                                );
-                                return Err(Error::ExecutorHashMismatch);
-                            }
-                        }
+                        error!(
+                            "CHECK-RANGE MISMATCH at block {}: consensus_hash={:?} reth_stored_hash={:?} reth_parent_hash={:?} reth_extra_data={:?}",
+                            block_num,
+                            block_hash,
+                            evm_block.header.hash,
+                            evm_block.header.parent_hash,
+                            evm_block.header.extra_data,
+                        );
+                        return Err(Error::ExecutorHashMismatch);
                     }
                     continue;
                 }
