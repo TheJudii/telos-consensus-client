@@ -6,3 +6,6 @@ translator-config.toml
 *.log
 *.pid
 /testnet*
+
+# Runtime config + DB for mainnet-v2-quick instance — never commit
+mainnet-v2-quick/

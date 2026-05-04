@@ -72,7 +72,7 @@ pub async fn raw_deserializer(
                         .unwrap_or(u32::MAX),
                     max_messages_in_flight: 10000,
                     have_positions: vec![],
-                    irreversible_only: false, // TODO: Fork handling
+                    irreversible_only: false, // fork-handling MVP: SHIP streams head blocks; CL handles reorgs via rewind-to-LIB on hash mismatch (see client.rs::handle_reorg)
                     fetch_block: true,
                     fetch_traces: true,
                     fetch_deltas: true,

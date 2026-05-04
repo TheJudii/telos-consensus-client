@@ -108,6 +108,14 @@ impl Database {
             return Ok(None);
         }
 
+        // The default column family also contains the "lib" key. seek_for_prev
+        // could land on it when no block keys are present yet. Filter that out.
+        if let Some(key) = iter.key() {
+            if !key.starts_with(b"blocks:") {
+                return Ok(None);
+            }
+        }
+
         let Some(value) = iter.value() else {
             return Ok(None);
         };
@@ -116,6 +124,16 @@ impl Database {
             .map(Some)
             .map_err(|error| eyre!("Cannot parse block JSON: {error}"))
             .map_err(Error::Database)
+    }
+
+    /// Returns the highest-numbered block currently stored, if any. Used by
+    /// the fork-handling path to find the CL's most recently processed block
+    /// without depending on `latest_finalized_executor_block` (which trails
+    /// head when SHIP runs in head-tracking mode).
+    pub fn get_latest_block(&self) -> Result<Option<Block>, Error> {
+        // The same-prefix raw_iterator seek_for_prev with the largest possible
+        // block key returns the largest block: key in the database.
+        self.get_block_or_prev(u32::MAX)
     }
 
     pub fn get_lib(&self) -> Result<Option<Block>, Error> {
