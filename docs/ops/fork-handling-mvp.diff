@@ -1,0 +1,279 @@
+diff --git a/client/src/client.rs b/client/src/client.rs
+index c0bdad2..3d697de 100644
+--- a/client/src/client.rs
++++ b/client/src/client.rs
+@@ -162,6 +162,111 @@ impl ConsensusClient {
+ 
+             let block_num = block.block_num;
+ 
++            // Fast skip: a block at or below reth's most recently finalized
++            // (LIB) cannot fork — Savanna BFT guarantees finality is
++            // irreversible. Avoids per-block RPC chatter during startup
++            // catchup when SHIP redelivers everything from `evm_start_block`.
++            if let Some((latest_finalized_num, _)) = self.latest_evm_block() {
++                if block_num <= latest_finalized_num {
++                    debug!(
++                        "Block {block_num} skipped (<= reth finalized {latest_finalized_num})"
++                    );
++                    continue;
++                }
++            }
++
++            // ---- Fork-handling MVP (must run BEFORE put_block) ------------
++            // SHIP runs with `irreversible_only: false`, so it streams head
++            // blocks. Antelope DPoS produces ~6 microforks/day on mainnet
++            // (max observed depth: 7 blocks). Without explicit handling, a
++            // microfork either (a) trips the legacy ExecutorHashMismatch check
++            // and crashes the CL, or (b) silently lands as orphaned state in
++            // reth's MDBX.
++            //
++            // This block detects three fork shapes against the CL's own DB
++            // and, on detection, rewinds reth to LIB and clears the orphan
++            // CL DB entries above LIB. SHIP will continue to stream the new
++            // chain's blocks; subsequent loop iterations process them as
++            // normal forward progress.
++            //
++            // Detection runs BEFORE put_block so cl_latest reflects the
++            // previous-block state, not the block we just received.
++            //
++            // Three detection cases:
++            //   1. Same-height fork: SHIP delivers block N where we already
++            //      have a block at N with a different hash.
++            //   2. Parent-mismatch: SHIP delivers block at our_latest+1 whose
++            //      parent_hash differs from our latest's block_hash.
++            //   3. Below-latest with different hash: SHIP delivers an older
++            //      height where we have a different block (deeper reorg).
++            //
++            // After rewind, we fall through and process this block normally
++            // (it now becomes the new canonical block at its height).
++            // ---------------------------------------------------------------
++            let cl_latest_opt = self.db.get_latest_block()?;
++            if let Some(cl_latest) = &cl_latest_opt {
++                let new_hash = block.block_hash.to_string();
++                let new_parent = format!("{:?}", block.header.parent_hash);
++
++                let mut fork_detected = false;
++                let mut fork_kind = "";
++                let mut already_processed = false;
++
++                if block_num == cl_latest.number {
++                    if hashes_equal(&new_hash, &cl_latest.hash) {
++                        already_processed = true;
++                    } else {
++                        fork_detected = true;
++                        fork_kind = "same-height";
++                    }
++                } else if block_num == cl_latest.number + 1
++                    && !hashes_equal(&new_parent, &cl_latest.hash)
++                {
++                    fork_detected = true;
++                    fork_kind = "parent-mismatch";
++                } else if block_num < cl_latest.number {
++                    if let Some(stored) = self.db.get_block_or_prev(block_num)? {
++                        if stored.number == block_num {
++                            if hashes_equal(&stored.hash, &new_hash) {
++                                already_processed = true;
++                            } else {
++                                fork_detected = true;
++                                fork_kind = "deep";
++                            }
++                        }
++                    }
++                }
++
++                if already_processed {
++                    debug!("Block {block_num} already in CL DB; skipping");
++                    continue;
++                }
++
++                if fork_detected {
++                    warn!(
++                        "REORG ({fork_kind}) detected at block {} (cl_latest={}/{}, ship={}/{}, parent={})",
++                        block_num,
++                        cl_latest.number,
++                        cl_latest.hash,
++                        block_num,
++                        new_hash,
++                        new_parent,
++                    );
++                    self.handle_reorg(&lib, last_lib_hash).await?;
++                    last_lib_hash = None;  // reset; will be re-set on next finalized block
++                    // Refresh reth's finalized snapshot so subsequent
++                    // calculations reflect the post-rewind state. Best-effort:
++                    // a stale value here only affects logging.
++                    if let Ok(refreshed) =
++                        self.execution_api.get_latest_finalized_block().await
++                    {
++                        self.latest_finalized_executor_block = refreshed;
++                    }
++                    // Fall through and process the new (now-canonical) block.
++                }
++            }
++            // ---- end fork-handling MVP ------------------------------------
++
+             self.db.put_block(From::from(&block))?;
+             debug!("Block {block_num} put in the database");
+ 
+@@ -183,20 +288,6 @@ impl ConsensusClient {
+                 lib = new_lib.into();
+             }
+ 
+-            if let Some((latest_evm_num, latest_evm_hash)) = self.latest_evm_block() {
+-                // Check fork
+-                if block_num == latest_evm_num && block.block_hash.to_string() != latest_evm_hash {
+-                    error!("Fork detected! Latest executor block hash {latest_evm_num:?} does not match consensus block hash {block_num:?}");
+-                    return Err(Error::ExecutorHashMismatch);
+-                }
+-
+-                // Skip synced blocks
+-                if block_num <= latest_evm_num {
+-                    debug!("Block {block_num} skipped as its behind {latest_evm_num} evm block");
+-                    continue;
+-                }
+-            }
+-
+             let block_hash = block.block_hash;
+ 
+             if self.is_in_check_range(block_num.as_u64()) {
+@@ -435,4 +526,92 @@ impl ConsensusClient {
+             })
+             .await
+     }
++
++    /// Rewind both the CL DB and the reth canonical head back to LIB. Called
++    /// when a microfork is detected (see fork-handling block in `run`). LIB
++    /// is the safest rewind target because Savanna guarantees blocks at or
++    /// below LIB are irreversible.
++    ///
++    /// Steps:
++    ///   1. Resolve the LIB block from the CL DB (parsed into a B256 hash).
++    ///   2. Delete every CL DB entry with number > LIB.
++    ///   3. Send `engine_forkchoiceUpdatedV1(head=LIB, safe=LIB,
++    ///      finalized=LIB)` to reth. With `--engine.persistence-threshold`
++    ///      tuned above the worst observed fork depth, reth's in-memory
++    ///      buffer holds the rewound state and discards orphan ExecutedBlocks
++    ///      cleanly.
++    ///
++    /// After this returns, the caller falls through to process the
++    /// fork-triggering block as a normal forward step (it's now the new
++    /// canonical block at `LIB.number + 1` or higher).
++    async fn handle_reorg(
++        &self,
++        lib: &data::Block,
++        last_lib_hash: Option<B256>,
++    ) -> Result<(), Error> {
++        let lib_number = lib.number;
++        let lib_hash: B256 = lib.hash.parse().map_err(|_| {
++            Error::Database(eyre::eyre!(
++                "handle_reorg: stored LIB hash {} is not a valid B256",
++                lib.hash
++            ))
++        })?;
++
++        // Step 1: delete CL DB entries above LIB. Best-effort; failures
++        // here are logged but don't abort the reorg — reth is the source
++        // of truth post-fcU.
++        if let Some(cl_latest) = self.db.get_latest_block()? {
++            if cl_latest.number > lib_number {
++                let mut deleted = 0u32;
++                for n in (lib_number + 1)..=cl_latest.number {
++                    if let Err(e) = self.db.delete_block(n) {
++                        warn!("handle_reorg: delete_block({n}) failed: {e}");
++                    } else {
++                        deleted = deleted.saturating_add(1);
++                    }
++                }
++                info!(
++                    "handle_reorg: deleted {deleted} CL DB blocks above LIB ({lib_number})"
++                );
++            }
++        }
++
++        // Step 2: send fcU(head=LIB, safe=LIB, finalized=LIB) so reth
++        // discards everything above LIB. Use last_lib_hash (the most recent
++        // finalized hash we sent) if it differs — but the safest baseline is
++        // the LIB block hash itself.
++        let finalized = last_lib_hash.unwrap_or(lib_hash);
++        let result = self
++            .fork_choice_updated(lib_hash, lib_hash, finalized)
++            .await
++            .map_err(|e| ForkChoiceUpdated(format!("rewind fcU failed: {e}")))?;
++
++        if let Some(error) = &result.error {
++            return Err(ForkChoiceUpdated(format!(
++                "rewind fcU returned error: {}",
++                error.message
++            )));
++        }
++
++        info!(
++            "handle_reorg: rewound reth to LIB block {lib_number} hash {lib_hash:?} (fcU result {:?})",
++            result.result
++        );
++
++        Ok(())
++    }
++}
++
++/// Compare two hex-encoded hashes case-insensitively, ignoring an optional
++/// `0x` prefix. Used by fork detection because `block.block_hash.to_string()`
++/// (antelope `Checksum256`) and `format!("{:?}", b256)` (alloy `B256`) can
++/// emit slightly different lowercase/uppercase or prefix conventions.
++fn hashes_equal(a: &str, b: &str) -> bool {
++    let strip = |s: &str| -> String {
++        s.strip_prefix("0x")
++            .or_else(|| s.strip_prefix("0X"))
++            .unwrap_or(s)
++            .to_ascii_lowercase()
++    };
++    strip(a) == strip(b)
+ }
+diff --git a/client/src/data.rs b/client/src/data.rs
+index c179bbb..b9d5327 100644
+--- a/client/src/data.rs
++++ b/client/src/data.rs
+@@ -108,6 +108,14 @@ impl Database {
+             return Ok(None);
+         }
+ 
++        // The default column family also contains the "lib" key. seek_for_prev
++        // could land on it when no block keys are present yet. Filter that out.
++        if let Some(key) = iter.key() {
++            if !key.starts_with(b"blocks:") {
++                return Ok(None);
++            }
++        }
++
+         let Some(value) = iter.value() else {
+             return Ok(None);
+         };
+@@ -118,6 +126,16 @@ impl Database {
+             .map_err(Error::Database)
+     }
+ 
++    /// Returns the highest-numbered block currently stored, if any. Used by
++    /// the fork-handling path to find the CL's most recently processed block
++    /// without depending on `latest_finalized_executor_block` (which trails
++    /// head when SHIP runs in head-tracking mode).
++    pub fn get_latest_block(&self) -> Result<Option<Block>, Error> {
++        // The same-prefix raw_iterator seek_for_prev with the largest possible
++        // block key returns the largest block: key in the database.
++        self.get_block_or_prev(u32::MAX)
++    }
++
+     pub fn get_lib(&self) -> Result<Option<Block>, Error> {
+         self.db
+             .get("lib")
+diff --git a/translator/src/tasks/raw_deserializer.rs b/translator/src/tasks/raw_deserializer.rs
+index f2d3d38..5c967b6 100644
+--- a/translator/src/tasks/raw_deserializer.rs
++++ b/translator/src/tasks/raw_deserializer.rs
+@@ -72,7 +72,7 @@ pub async fn raw_deserializer(
+                         .unwrap_or(u32::MAX),
+                     max_messages_in_flight: 10000,
+                     have_positions: vec![],
+-                    irreversible_only: false, // TODO: Fork handling
++                    irreversible_only: false, // fork-handling MVP: SHIP streams head blocks; CL handles reorgs via rewind-to-LIB on hash mismatch (see client.rs::handle_reorg)
+                     fetch_block: true,
+                     fetch_traces: true,
+                     fetch_deltas: true,
