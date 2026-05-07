@@ -1,4 +1,4 @@
-use crate::block::{DecodedRow, TelosEVMBlock, WalletEvents};
+use crate::block::{DecodedRow, GeneratedEvmData, TelosEVMBlock, WalletEvents};
 use crate::types::env::TESTNET_DEPLOY_STATE;
 use crate::types::translator_types::{generate_extra_fields_from_json, ChainId};
 use crate::{
@@ -22,6 +22,7 @@ use tracing::{debug, error, info, warn};
 struct BlockMap {
     parent_hash: B256,
     prev_block_num: Option<u32>,
+    last_ship_hash: Option<String>,
     map: HashMap<String, (u32, B256)>,
 }
 
@@ -30,6 +31,7 @@ impl BlockMap {
         Self {
             parent_hash,
             prev_block_num: None,
+            last_ship_hash: None,
             map: HashMap::new(),
         }
     }
@@ -40,32 +42,63 @@ impl BlockMap {
         };
 
         let block_num = block.block_num;
-        if block_num == prev_block_num + 1 {
+        let prev_ship_hash = block.prev_block_hash.map(|hash| hash.as_string());
+
+        if block_num == prev_block_num + 1
+            && (prev_ship_hash.is_none()
+                || prev_ship_hash.as_deref() == self.last_ship_hash.as_deref())
+        {
             return Some(self.parent_hash);
         }
 
         debug!("Fork detected for block_num: {block_num}, prev_block_num = {prev_block_num}");
-        block
-            .prev_block_hash
-            .map(|hash| hash.as_string())
+        prev_ship_hash
             .as_ref()
-            .and_then(|hash| self.map.get(hash).cloned())
+            .and_then(|hash| self.map.get(hash).copied())
             .map(|(_, hash)| hash)
+    }
+
+    fn remember_hash(&mut self, native_hash: String, native_block_num: u32, evm_hash: B256) {
+        self.map.insert(native_hash, (native_block_num, evm_hash));
+    }
+
+    fn record_skipped_fork_block(
+        &mut self,
+        native_hash: String,
+        native_block_num: u32,
+        evm_hash: B256,
+        lib_num: u32,
+    ) {
+        self.remember_hash(native_hash.clone(), native_block_num, evm_hash);
+        self.prev_block_num = Some(native_block_num);
+        self.last_ship_hash = Some(native_hash);
+        self.parent_hash = evm_hash;
+        self.prune_final_hashes(lib_num);
+    }
+
+    fn prune_final_hashes(&mut self, lib_num: u32) {
+        let size_before = self.map.len();
+        self.map.retain(|_, &mut (num, _)| num >= lib_num);
+        debug!(
+            "Removed {} final blocks from the map",
+            size_before - self.map.len()
+        );
     }
 
     fn next(&mut self, block: &TelosEVMBlock, chain_id: &ChainId) {
         let block_num = block.block_num_with_delta(chain_id);
 
         self.prev_block_num = Some(block_num);
-        self.map
-            .insert(block.ship_hash.clone(), (block_num, block.block_hash));
+        self.last_ship_hash = Some(block.ship_hash.clone());
+        self.remember_hash(block.ship_hash.clone(), block_num, block.block_hash);
+
+        let canonical_ship_hash = encode(block.header.extra_data.as_ref());
+        if !canonical_ship_hash.is_empty() && canonical_ship_hash != block.ship_hash {
+            self.remember_hash(canonical_ship_hash, block_num, block.block_hash);
+        }
+
         self.parent_hash = block.block_hash;
-        let size_before = self.map.len();
-        self.map.retain(|_, &mut (num, _)| num >= block.lib_num);
-        debug!(
-            "Removed {} final blocks from the map",
-            size_before - self.map.len()
-        );
+        self.prune_final_hashes(block.lib_num);
     }
 }
 
@@ -113,9 +146,33 @@ pub async fn final_processor(
             .parent_hash(&block)
             .expect("Block parent hash can be found");
 
-        let (header, exec_payload) = block
+        let generated = block
             .generate_evm_data(parent_hash, block_delta, &native_to_evm_cache)
             .await?;
+
+        let (header, exec_payload) = match generated {
+            GeneratedEvmData::Canonical {
+                header,
+                execution_payload,
+            } => (header, execution_payload),
+            GeneratedEvmData::NonCanonical {
+                evm_block_num,
+                local_hash,
+                reference_hash,
+            } => {
+                warn!(
+                    "Skipping noncanonical SHIP block {} (EVM {}): local_hash={} reference_hash={}",
+                    block_num, evm_block_num, local_hash, reference_hash
+                );
+                block_map.record_skipped_fork_block(
+                    block.block_hash.as_string(),
+                    block_num,
+                    local_hash,
+                    block.lib_num,
+                );
+                continue;
+            }
+        };
 
         let block_hash = exec_payload.block_hash;
 
@@ -325,4 +382,67 @@ pub async fn final_processor(
     while rx.recv().await.is_some() {}
     info!("Exiting final processor...");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::block::ProcessingEVMBlockArgs;
+    use crate::types::ship_types::GetBlocksResultV0;
+    use antelope::chain::checksum::Checksum256;
+
+    fn checksum(byte: u8) -> Checksum256 {
+        Checksum256::from_bytes(&[byte; 32]).unwrap()
+    }
+
+    fn evm_hash(byte: u8) -> B256 {
+        B256::from([byte; 32])
+    }
+
+    fn processing_block(
+        native_block_num: u32,
+        native_hash: Checksum256,
+        prev_native_hash: Option<Checksum256>,
+    ) -> ProcessingEVMBlock {
+        ProcessingEVMBlock::new(ProcessingEVMBlockArgs {
+            chain_id: 40,
+            block_num: native_block_num,
+            block_hash: native_hash,
+            prev_block_hash: prev_native_hash,
+            lib_num: 90,
+            lib_hash: checksum(0xee),
+            result: GetBlocksResultV0::default(),
+            skip_events: false,
+            rpc_fallback_endpoint: Some("http://127.0.0.1:8888".to_string()),
+            rpc_fallback_sample_every_n: 1,
+            block_timestamp: 0,
+        })
+    }
+
+    #[test]
+    fn skipped_fork_block_can_parent_losing_child() {
+        let losing_native = checksum(0x22);
+        let losing_evm = evm_hash(0x33);
+
+        let mut map = BlockMap::new(evm_hash(0x11));
+        map.record_skipped_fork_block(losing_native.as_string(), 101, losing_evm, 90);
+
+        let losing_child = processing_block(102, checksum(0x44), Some(losing_native));
+        assert_eq!(map.parent_hash(&losing_child), Some(losing_evm));
+    }
+
+    #[test]
+    fn sequential_branch_switch_uses_prev_native_hash_mapping() {
+        let losing_native = checksum(0x22);
+        let canonical_native = checksum(0x55);
+        let losing_evm = evm_hash(0x33);
+        let canonical_evm = evm_hash(0x66);
+
+        let mut map = BlockMap::new(evm_hash(0x11));
+        map.record_skipped_fork_block(losing_native.as_string(), 101, losing_evm, 90);
+        map.remember_hash(canonical_native.as_string(), 101, canonical_evm);
+
+        let canonical_child = processing_block(102, checksum(0x77), Some(canonical_native));
+        assert_eq!(map.parent_hash(&canonical_child), Some(canonical_evm));
+    }
 }

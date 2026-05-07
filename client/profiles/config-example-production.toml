@@ -1,8 +1,9 @@
 # Telos Consensus Client - PRODUCTION profile template.
 #
-# Safety posture: every block is validated against the reference RPC
-# (rpc_fallback_sample_every_n = 1). This is the recommended default
-# for any node that serves public traffic or advances canonical state.
+# Safety posture for pre-Savannah head-tracking: every block is validated
+# against the reference RPC before it is forwarded to reth. The branch
+# also enforces rpc_fallback_sample_every_n = 1 at runtime because
+# irreversible_only is disabled.
 #
 # Compared to the quick-sync profile (rpc_fallback_sample_every_n = 10):
 #   - ~10x slower on empty-block-heavy ranges (initial historical sync)
@@ -43,7 +44,7 @@ latest_blocks_in_db_num = 10000
 # Reference RPC for fallback + sampling validation
 rpc_fallback_endpoint = "https://rpc.testnet.telos.net"
 
-# PRODUCTION-SAFE SAMPLING: validate every block.
+# REQUIRED FOR HEAD-TRACKING: validate every block.
 rpc_fallback_sample_every_n = 1
 
 # Channel sizing

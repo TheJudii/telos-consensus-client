@@ -1,9 +1,9 @@
 # Telos Consensus Client - QUICK-SYNC profile template.
 #
-# DO NOT USE IN PRODUCTION. This profile is optimized for fast
-# initial catch-up and development. It samples only 1-in-10 empty
-# blocks against the reference RPC (rpc_fallback_sample_every_n = 10),
-# trading ~10x throughput for reduced safety margin on empty blocks.
+# DO NOT USE WITH PRE-SAVANNAH HEAD-TRACKING. This profile is optimized
+# for finalized-only initial catch-up and development. The release branch
+# enforces rpc_fallback_sample_every_n = 1 whenever irreversible_only is
+# disabled, so this value is only meaningful on finalized-only builds.
 #
 # Blocks WITH transactions are always fully validated regardless
 # of sampling rate, so this profile is safe for EVM activity
@@ -35,7 +35,8 @@ latest_blocks_in_db_num = 1800
 
 rpc_fallback_endpoint = "https://rpc.testnet.telos.net"
 
-# QUICK-SYNC SAMPLING: sample 1 in 10 empty blocks. Faster, less safe.
+# FINALIZED-ONLY QUICK-SYNC SAMPLING: sample 1 in 10 empty blocks.
+# Head-tracking builds override this to 1 at runtime.
 rpc_fallback_sample_every_n = 10
 
 raw_message_channel_size = 5000

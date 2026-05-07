@@ -13,7 +13,7 @@ use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 pub async fn raw_deserializer(
     config: TranslatorConfig,
@@ -25,6 +25,7 @@ pub async fn raw_deserializer(
     let mut last_log = Instant::now();
     let mut unlogged_blocks = 0;
     let block_delta = config.chain_id.block_delta();
+    let mut rpc_fallback_sample_every_n = config.rpc_fallback_sample_every_n;
 
     // TODO: maybe get this working as an ABI again?
     //   the problem is that the ABI from ship has invalid table names like `account_metadata`
@@ -54,6 +55,21 @@ pub async fn raw_deserializer(
 
         match ship_result {
             ShipResult::GetStatusResultV0(r) => {
+                if config.rpc_fallback_endpoint.is_none() {
+                    return Err(eyre!(
+                        "pre-Savannah head-tracking mode requires rpc_fallback_endpoint so every SHIP block can be checked before reth sees it"
+                    ));
+                }
+                rpc_fallback_sample_every_n = if config.rpc_fallback_sample_every_n != 1 {
+                    warn!(
+                        "pre-Savannah head-tracking mode requires rpc_fallback_sample_every_n=1; overriding configured value {}",
+                        config.rpc_fallback_sample_every_n
+                    );
+                    1
+                } else {
+                    config.rpc_fallback_sample_every_n
+                };
+
                 let start_block_num = config.evm_start_block + block_delta;
                 let chain_begin_block = r.chain_state_begin_block;
                 if start_block_num <= chain_begin_block {
@@ -72,7 +88,7 @@ pub async fn raw_deserializer(
                         .unwrap_or(u32::MAX),
                     max_messages_in_flight: 10000,
                     have_positions: vec![],
-                    irreversible_only: true, // #71: prevent microfork capture by only consuming finalized blocks (~3min LIB lag)
+                    irreversible_only: false, // pre-Savannah head-tracking: stream reversible blocks, validate every block before forwarding
                     fetch_block: true,
                     fetch_traces: true,
                     fetch_deltas: true,
@@ -88,7 +104,9 @@ pub async fn raw_deserializer(
                         <= config.evm_deploy_block.unwrap_or_default();
 
                     // Extract block timestamp from the signed block if available
-                    let block_timestamp = r.block.as_ref()
+                    let block_timestamp = r
+                        .block
+                        .as_ref()
                         .and_then(|block_data| {
                             // Try to decode SignedBlock to get timestamp
                             use antelope::chain::Packer;
@@ -108,7 +126,7 @@ pub async fn raw_deserializer(
                         result: r.clone(),
                         skip_events,
                         rpc_fallback_endpoint: config.rpc_fallback_endpoint.clone(),
-                        rpc_fallback_sample_every_n: config.rpc_fallback_sample_every_n,
+                        rpc_fallback_sample_every_n,
                         block_timestamp,
                     });
                     if block_deserializer_tx.is_closed() {

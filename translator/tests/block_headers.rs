@@ -3,9 +3,8 @@ use antelope::{
     api::client::{APIClient, DefaultProvider},
     chain::{checksum::Checksum256, Encoder},
 };
-use telos_translator_rs::block::ProcessingEVMBlockArgs;
 use telos_translator_rs::{
-    block::ProcessingEVMBlock,
+    block::{GeneratedEvmData, ProcessingEVMBlock, ProcessingEVMBlockArgs},
     types::{
         env::{ANTELOPE_EPOCH_MS, ANTELOPE_INTERVAL_MS, MAINNET_DEPLOY_CONFIG},
         ship_types::{
@@ -79,6 +78,9 @@ async fn generate_block(
             deltas: Some(vec![]),
         },
         skip_events: false,
+        rpc_fallback_endpoint: None,
+        rpc_fallback_sample_every_n: 1,
+        block_timestamp: 0,
     })
 }
 
@@ -100,7 +102,10 @@ async fn genesis_mainnet() {
 
     block.deserialize();
 
-    if let Ok((header, payload)) = block
+    if let Ok(GeneratedEvmData::Canonical {
+        header,
+        execution_payload: payload,
+    }) = block
         .generate_evm_data(
             zero_bytes,
             evm_chain_id_mainnet.block_delta(),
@@ -143,7 +148,10 @@ async fn deploy_mainnet() {
 
     block.deserialize();
 
-    if let Ok((header, payload)) = block
+    if let Ok(GeneratedEvmData::Canonical {
+        header,
+        execution_payload: payload,
+    }) = block
         .generate_evm_data(
             parent_hash,
             evm_chain_id_mainnet.block_delta(),
