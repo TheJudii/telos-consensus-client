@@ -26,7 +26,8 @@ fn decode_block() {
                     lib_hash: Checksum256::default(),
                     result: r.clone(),
                     skip_events: false,
-                    rpc_fallback_endpoint: None,
+                    rpc_fallback_endpoints: vec![],
+                    rpc_fallback_quorum: 0,
                     rpc_fallback_sample_every_n: 1,
                     block_timestamp: 0,
                 });

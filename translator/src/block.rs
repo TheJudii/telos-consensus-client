@@ -19,12 +19,14 @@ use antelope::chain::checksum::Checksum256;
 use antelope::chain::name::Name;
 use antelope::serializer::Packer;
 use eyre::eyre;
+use futures_util::future::join_all;
 use reth_primitives::ReceiptWithBloom;
 use reth_telos_rpc_engine_api::structs::TelosEngineAPIExtraFields;
 use reth_trie_common::root::ordered_trie_root_with_encoder;
 use std::cmp::{max, Ordering};
-use std::collections::BTreeMap;
-use tracing::{debug, info, warn};
+use std::collections::{BTreeMap, HashMap};
+use std::time::Duration;
+use tracing::{debug, warn};
 
 const MINIMUM_FEE_PER_GAS: u128 = 7;
 
@@ -128,7 +130,8 @@ pub struct ProcessingEVMBlock {
     pub lib_num: u32,
     pub lib_hash: Checksum256,
     pub skip_events: bool,
-    rpc_fallback_endpoint: Option<String>,
+    rpc_fallback_endpoints: Vec<String>,
+    rpc_fallback_quorum: usize,
     rpc_fallback_sample_every_n: u32,
     block_timestamp: u64,
     /// Count of tx-bearing eosio.evm actions observed during handle_action.
@@ -137,6 +140,7 @@ pub struct ProcessingEVMBlock {
     /// (which can falsely mean "we dropped them silently"). See block.rs
     /// commentary around the skip path for full rationale.
     pub tx_actions_seen: u32,
+    missing_receipt_tx_hash: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -162,6 +166,21 @@ pub enum GeneratedEvmData {
         local_hash: B256,
         reference_hash: B256,
     },
+    ValidationUnavailable {
+        reason: String,
+    },
+}
+
+enum HashValidation {
+    Canonical,
+    NonCanonical { reference_hash: B256 },
+    QuorumUnavailable { reason: String },
+}
+
+enum TxMembershipValidation {
+    Included { reference_hash: B256 },
+    Omitted { reference_hash: B256 },
+    QuorumUnavailable { reason: String },
 }
 
 impl TelosEVMBlock {
@@ -201,7 +220,8 @@ pub struct ProcessingEVMBlockArgs {
     pub lib_hash: Checksum256,
     pub result: GetBlocksResultV0,
     pub skip_events: bool,
-    pub rpc_fallback_endpoint: Option<String>,
+    pub rpc_fallback_endpoints: Vec<String>,
+    pub rpc_fallback_quorum: usize,
     pub rpc_fallback_sample_every_n: u32,
     pub block_timestamp: u64,
 }
@@ -217,7 +237,8 @@ impl ProcessingEVMBlock {
             lib_hash,
             result,
             skip_events,
-            rpc_fallback_endpoint,
+            rpc_fallback_endpoints,
+            rpc_fallback_quorum,
             rpc_fallback_sample_every_n,
             block_timestamp,
         } = args;
@@ -242,10 +263,12 @@ impl ProcessingEVMBlock {
             new_gas_price: None,
             new_revision: None,
             new_wallets: vec![],
-            rpc_fallback_endpoint,
+            rpc_fallback_endpoints,
+            rpc_fallback_quorum,
             rpc_fallback_sample_every_n,
             block_timestamp,
             tx_actions_seen: 0,
+            missing_receipt_tx_hash: None,
         }
     }
 
@@ -310,8 +333,47 @@ impl ProcessingEVMBlock {
         }
     }
 
-    async fn fetch_receipt_from_rpc(
-        &self,
+    fn effective_rpc_quorum(&self) -> usize {
+        let endpoint_count = self.rpc_fallback_endpoints.len();
+        if endpoint_count == 0 {
+            0
+        } else {
+            self.rpc_fallback_quorum.clamp(1, endpoint_count)
+        }
+    }
+
+    fn has_canonical_rpc(&self) -> bool {
+        !self.rpc_fallback_endpoints.is_empty() && self.effective_rpc_quorum() > 0
+    }
+
+    async fn fetch_receipt_from_rpc(&self, tx_hash: &str) -> eyre::Result<Option<RpcReceipt>> {
+        if self.rpc_fallback_endpoints.is_empty() {
+            return Err(eyre!("No RPC fallback endpoints configured"));
+        }
+
+        let mut null_endpoints = Vec::new();
+        let mut errors = Vec::new();
+
+        for rpc_endpoint in &self.rpc_fallback_endpoints {
+            match Self::fetch_receipt_from_rpc_endpoint(rpc_endpoint, tx_hash).await {
+                Ok(Some(receipt)) => return Ok(Some(receipt)),
+                Ok(None) => null_endpoints.push(rpc_endpoint.clone()),
+                Err(error) => errors.push(format!("{rpc_endpoint}: {error}")),
+            }
+        }
+
+        if !null_endpoints.is_empty() {
+            return Ok(None);
+        }
+
+        Err(eyre!(
+            "all RPC receipt fallbacks failed for tx {}: {}",
+            tx_hash,
+            errors.join("; ")
+        ))
+    }
+
+    async fn fetch_receipt_from_rpc_endpoint(
         rpc_endpoint: &str,
         tx_hash: &str,
     ) -> eyre::Result<Option<RpcReceipt>> {
@@ -327,6 +389,7 @@ impl ProcessingEVMBlock {
         static RPC_CLIENT_RECEIPT: LazyLock<reqwest::Client> = LazyLock::new(|| {
             reqwest::Client::builder()
                 .pool_max_idle_per_host(4)
+                .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap_or_default()
         });
@@ -361,6 +424,275 @@ impl ProcessingEVMBlock {
             .map_err(|e| eyre!("Failed to parse receipt from RPC: {}", e))?;
 
         Ok(Some(receipt))
+    }
+
+    async fn fetch_block_hash_from_rpc(
+        rpc_endpoint: String,
+        evm_block_num: u64,
+    ) -> (String, Result<B256, String>) {
+        let block_hex = format!("0x{:x}", evm_block_num);
+        let hash_request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "eth_getBlockByNumber",
+            "params": [block_hex, false],
+            "id": 1,
+        });
+
+        use std::sync::LazyLock;
+        static RPC_CLIENT_HASH: LazyLock<reqwest::Client> = LazyLock::new(|| {
+            reqwest::Client::builder()
+                .pool_max_idle_per_host(4)
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap_or_default()
+        });
+
+        let result = async {
+            let response = RPC_CLIENT_HASH
+                .post(&rpc_endpoint)
+                .json(&hash_request)
+                .send()
+                .await
+                .map_err(|e| format!("request failed: {e}"))?;
+
+            if !response.status().is_success() {
+                return Err(format!("HTTP {}", response.status()));
+            }
+
+            let json_response = response
+                .json::<serde_json::Value>()
+                .await
+                .map_err(|e| format!("invalid JSON response: {e}"))?;
+
+            if let Some(error) = json_response.get("error") {
+                return Err(format!("RPC error: {error}"));
+            }
+
+            let result = json_response
+                .get("result")
+                .ok_or_else(|| "missing result".to_string())?;
+            if result.is_null() {
+                return Err("block unavailable".to_string());
+            }
+
+            let hash = result["hash"]
+                .as_str()
+                .ok_or_else(|| "missing hash".to_string())?
+                .parse::<B256>()
+                .map_err(|e| format!("invalid hash: {e}"))?;
+
+            Ok(hash)
+        }
+        .await;
+
+        (rpc_endpoint, result)
+    }
+
+    async fn validate_hash_with_quorum(
+        &self,
+        evm_block_num: u64,
+        our_hash: B256,
+    ) -> HashValidation {
+        let quorum = self.effective_rpc_quorum();
+        if quorum == 0 {
+            return HashValidation::Canonical;
+        }
+
+        let results = join_all(
+            self.rpc_fallback_endpoints
+                .iter()
+                .cloned()
+                .map(|endpoint| Self::fetch_block_hash_from_rpc(endpoint, evm_block_num)),
+        )
+        .await;
+
+        let mut votes: HashMap<B256, usize> = HashMap::new();
+        let mut errors = Vec::new();
+        let mut reachable = 0usize;
+
+        for (endpoint, result) in results {
+            match result {
+                Ok(hash) => {
+                    reachable += 1;
+                    *votes.entry(hash).or_default() += 1;
+                }
+                Err(error) => errors.push(format!("{endpoint}: {error}")),
+            }
+        }
+
+        if let Some((reference_hash, votes)) = votes.iter().max_by_key(|(_, votes)| *votes) {
+            if *votes >= quorum {
+                if *reference_hash == our_hash {
+                    return HashValidation::Canonical;
+                }
+
+                return HashValidation::NonCanonical {
+                    reference_hash: *reference_hash,
+                };
+            }
+        }
+
+        let mut tallies = votes
+            .iter()
+            .map(|(hash, votes)| format!("{hash}={votes}"))
+            .collect::<Vec<_>>();
+        tallies.sort();
+
+        HashValidation::QuorumUnavailable {
+            reason: format!(
+                "canonical hash quorum unavailable for EVM block {}: reachable={}/{}, quorum={}, tallies=[{}], errors=[{}]",
+                evm_block_num,
+                reachable,
+                self.rpc_fallback_endpoints.len(),
+                quorum,
+                tallies.join(", "),
+                errors.join("; ")
+            ),
+        }
+    }
+
+    async fn fetch_block_tx_membership_from_rpc(
+        rpc_endpoint: String,
+        evm_block_num: u64,
+        tx_hash: String,
+    ) -> (String, Result<(B256, bool), String>) {
+        let block_hex = format!("0x{:x}", evm_block_num);
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "eth_getBlockByNumber",
+            "params": [block_hex, false],
+            "id": 1,
+        });
+
+        use std::sync::LazyLock;
+        static RPC_CLIENT_TX_MEMBERSHIP: LazyLock<reqwest::Client> = LazyLock::new(|| {
+            reqwest::Client::builder()
+                .pool_max_idle_per_host(4)
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap_or_default()
+        });
+
+        let result = async {
+            let response = RPC_CLIENT_TX_MEMBERSHIP
+                .post(&rpc_endpoint)
+                .json(&request)
+                .send()
+                .await
+                .map_err(|e| format!("request failed: {e}"))?;
+
+            if !response.status().is_success() {
+                return Err(format!("HTTP {}", response.status()));
+            }
+
+            let json_response = response
+                .json::<serde_json::Value>()
+                .await
+                .map_err(|e| format!("invalid JSON response: {e}"))?;
+
+            if let Some(error) = json_response.get("error") {
+                return Err(format!("RPC error: {error}"));
+            }
+
+            let result = json_response
+                .get("result")
+                .ok_or_else(|| "missing result".to_string())?;
+            if result.is_null() {
+                return Err("block unavailable".to_string());
+            }
+
+            let block_hash = result["hash"]
+                .as_str()
+                .ok_or_else(|| "missing hash".to_string())?
+                .parse::<B256>()
+                .map_err(|e| format!("invalid hash: {e}"))?;
+
+            let contains_tx = result["transactions"]
+                .as_array()
+                .map(|transactions| {
+                    transactions.iter().any(|tx| {
+                        tx.as_str()
+                            .or_else(|| tx.get("hash").and_then(|hash| hash.as_str()))
+                            .is_some_and(|hash| hash.eq_ignore_ascii_case(&tx_hash))
+                    })
+                })
+                .unwrap_or(false);
+
+            Ok((block_hash, contains_tx))
+        }
+        .await;
+
+        (rpc_endpoint, result)
+    }
+
+    async fn validate_tx_membership_with_quorum(
+        &self,
+        evm_block_num: u64,
+        tx_hash: &str,
+    ) -> TxMembershipValidation {
+        let quorum = self.effective_rpc_quorum();
+        if quorum == 0 {
+            return TxMembershipValidation::QuorumUnavailable {
+                reason: "no canonical RPC quorum configured".to_string(),
+            };
+        }
+
+        let results = join_all(self.rpc_fallback_endpoints.iter().cloned().map(|endpoint| {
+            Self::fetch_block_tx_membership_from_rpc(endpoint, evm_block_num, tx_hash.to_string())
+        }))
+        .await;
+
+        let mut by_hash: HashMap<B256, Vec<bool>> = HashMap::new();
+        let mut errors = Vec::new();
+        let mut reachable = 0usize;
+
+        for (endpoint, result) in results {
+            match result {
+                Ok((block_hash, contains_tx)) => {
+                    reachable += 1;
+                    by_hash.entry(block_hash).or_default().push(contains_tx);
+                }
+                Err(error) => errors.push(format!("{endpoint}: {error}")),
+            }
+        }
+
+        if let Some((reference_hash, memberships)) =
+            by_hash.iter().max_by_key(|(_, memberships)| memberships.len())
+        {
+            if memberships.len() >= quorum {
+                if memberships.iter().any(|contains_tx| *contains_tx) {
+                    return TxMembershipValidation::Included {
+                        reference_hash: *reference_hash,
+                    };
+                }
+
+                return TxMembershipValidation::Omitted {
+                    reference_hash: *reference_hash,
+                };
+            }
+        }
+
+        let mut tallies = by_hash
+            .iter()
+            .map(|(hash, memberships)| {
+                let includes = memberships.iter().filter(|contains_tx| **contains_tx).count();
+                format!("{hash}=votes:{},tx_included:{}", memberships.len(), includes)
+            })
+            .collect::<Vec<_>>();
+        tallies.sort();
+
+        TxMembershipValidation::QuorumUnavailable {
+            reason: format!(
+                "canonical tx membership quorum unavailable for EVM block {}, tx {}: reachable={}/{}, quorum={}, tallies=[{}], errors=[{}]",
+                evm_block_num,
+                tx_hash,
+                reachable,
+                self.rpc_fallback_endpoints.len(),
+                quorum,
+                tallies.join(", "),
+                errors.join("; ")
+            ),
+        }
     }
 
     async fn handle_action(
@@ -402,22 +734,19 @@ impl ProcessingEVMBlock {
             // production.
             //
             // Fallback mechanism: if no PrintedReceipt is found in console output
-            // and rpc_fallback_endpoint is configured, fetch the receipt from the
+            // and RPC fallback endpoints are configured, fetch the receipt from the
             // RPC endpoint using eth_getTransactionReceipt.
             let raw_console_bytes = action.raw_console();
             let printed_receipt = match PrintedReceipt::from_console(action.console()) {
                 Some(r) => r,
                 None => {
                     // Try RPC fallback if configured
-                    if let Some(rpc_endpoint) = &self.rpc_fallback_endpoint {
+                    if self.has_canonical_rpc() {
                         // Compute tx hash from raw tx bytes
                         let tx_hash = keccak256(&raw.tx);
                         let tx_hash_str = format!("0x{}", hex::encode(tx_hash));
 
-                        match self
-                            .fetch_receipt_from_rpc(rpc_endpoint, &tx_hash_str)
-                            .await
-                        {
+                        match self.fetch_receipt_from_rpc(&tx_hash_str).await {
                             Ok(Some(rpc_receipt)) => {
                                 debug!(
                                     "Fetched receipt from RPC fallback for tx {} in block {}",
@@ -440,16 +769,16 @@ impl ProcessingEVMBlock {
                                 // produces an empty-block hash that diverges from
                                 // canonical and gets committed to reth without
                                 // verification when the block happens to not be
-                                // a sample block. Fail loud instead — the outer
-                                // handler at block.rs ~790 will catch this as an
-                                // action-processing error and fall back to
-                                // whole-block RPC fetch.
+                                // a sample block. Fail loud instead; the outer
+                                // handler checks canonical tx membership before
+                                // deciding whether to skip the fork block or retry.
                                 warn!(
-                                    "Single-tx receipt RPC returned null for tx {} in                                      block {}. Promoting to block-level fallback.",
+                                    "Single-tx receipt RPC returned null for tx {} in block {}. Checking canonical tx membership before retrying.",
                                     tx_hash_str, self.block_num
                                 );
+                                self.missing_receipt_tx_hash = Some(tx_hash_str.clone());
                                 return Err(eyre::eyre!(
-                                    "Single-tx receipt null for tx {} in block {}                                      (likely RPC replica lag); triggering block-level fallback",
+                                    "Single-tx receipt null for tx {} in block {} (likely RPC replica lag or noncanonical SHIP fork)",
                                     tx_hash_str, self.block_num
                                 ));
                             }
@@ -483,7 +812,7 @@ impl ProcessingEVMBlock {
                         return Err(eyre::eyre!(
                             "No parseable PrintedReceipt for raw action in block {}: \
                              raw console bytes len={}, first 256 bytes hex={:?}. \
-                             Configure rpc_fallback_endpoint to use RPC fallback.",
+                             Configure rpc_fallback_endpoints to use RPC fallback.",
                             self.block_num,
                             raw_console_bytes.len(),
                             hex_prefix,
@@ -568,187 +897,6 @@ impl ProcessingEVMBlock {
         Ok(())
     }
 
-    /// Fetch a full block from the reference RPC and reconstruct the execution payload.
-    /// Used when SHIP data is incomplete (missing action traces, console output, etc.)
-    /// and the locally-built block hash doesn't match production.
-    async fn fetch_block_from_rpc(
-        &self,
-        rpc_endpoint: &str,
-        evm_block_num: u64,
-        expected_parent_hash: B256,
-    ) -> eyre::Result<(Header, ExecutionPayloadV1)> {
-        let block_hex = format!("0x{:x}", evm_block_num);
-
-        let request_body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "eth_getBlockByNumber",
-            "params": [block_hex, true],
-            "id": 1,
-        });
-
-        use std::sync::LazyLock;
-        static RPC_CLIENT_BLOCK: LazyLock<reqwest::Client> = LazyLock::new(|| {
-            reqwest::Client::builder()
-                .pool_max_idle_per_host(4)
-                .build()
-                .unwrap_or_default()
-        });
-
-        let response = RPC_CLIENT_BLOCK
-            .post(rpc_endpoint)
-            .json(&request_body)
-            .send()
-            .await
-            .map_err(|e| eyre!("Failed to fetch block from RPC: {}", e))?;
-
-        let json_response: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|e| eyre!("Failed to parse block RPC response: {}", e))?;
-
-        let block_data = json_response
-            .get("result")
-            .ok_or_else(|| eyre!("No result in block RPC response"))?;
-
-        if block_data.is_null() {
-            return Err(eyre!("Block {} not found on reference RPC", evm_block_num));
-        }
-
-        // Parse the block fields we need
-        let block_hash_str = block_data["hash"]
-            .as_str()
-            .ok_or_else(|| eyre!("No hash in block"))?;
-        let block_hash: B256 = block_hash_str
-            .parse()
-            .map_err(|e| eyre!("Failed to parse block hash: {}", e))?;
-
-        let parent_hash_str = block_data["parentHash"]
-            .as_str()
-            .ok_or_else(|| eyre!("No parentHash in block"))?;
-        let parent_hash: B256 = parent_hash_str
-            .parse()
-            .map_err(|e| eyre!("Failed to parse parent hash: {}", e))?;
-        if parent_hash != expected_parent_hash {
-            warn!(
-                "RPC block {} parent differs from local parent: rpc={} local={}",
-                evm_block_num, parent_hash, expected_parent_hash
-            );
-        }
-
-        let gas_used_str = block_data["gasUsed"].as_str().unwrap_or("0x0");
-        let gas_used = u64::from_str_radix(gas_used_str.trim_start_matches("0x"), 16).unwrap_or(0);
-
-        let gas_limit_str = block_data["gasLimit"].as_str().unwrap_or("0x7fffffff");
-        let gas_limit = u64::from_str_radix(gas_limit_str.trim_start_matches("0x"), 16)
-            .unwrap_or(DEFAULT_GAS_LIMIT as u64);
-
-        let timestamp_str = block_data["timestamp"].as_str().unwrap_or("0x0");
-        let timestamp =
-            u64::from_str_radix(timestamp_str.trim_start_matches("0x"), 16).unwrap_or(0);
-
-        let extra_data_str = block_data["extraData"].as_str().unwrap_or("0x");
-        let extra_data = Bytes::from(
-            alloy::primitives::hex::decode(extra_data_str.trim_start_matches("0x"))
-                .unwrap_or_default(),
-        );
-
-        let tx_root_str = block_data["transactionsRoot"]
-            .as_str()
-            .unwrap_or("0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421");
-        let tx_root: B256 = tx_root_str.parse().unwrap_or(EMPTY_ROOT_HASH);
-
-        let receipts_root_str = block_data["receiptsRoot"]
-            .as_str()
-            .unwrap_or("0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421");
-        let receipts_root: B256 = receipts_root_str.parse().unwrap_or(EMPTY_ROOT_HASH);
-
-        let logs_bloom_str = block_data["logsBloom"].as_str().unwrap_or("0x00");
-        let logs_bloom_bytes =
-            alloy::primitives::hex::decode(logs_bloom_str.trim_start_matches("0x"))
-                .unwrap_or_default();
-        let logs_bloom = Bloom::from_slice(&logs_bloom_bytes);
-
-        // Collect raw transaction bytes
-        let txs_array = block_data["transactions"].as_array();
-        let mut transactions: Vec<Bytes> = Vec::new();
-
-        if let Some(txs) = txs_array {
-            for tx_val in txs {
-                // For full tx objects, we need to fetch the raw tx
-                if let Some(tx_hash_str) = tx_val["hash"].as_str() {
-                    // Fetch raw transaction via eth_getRawTransactionByHash
-                    let raw_tx_request = serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "method": "eth_getRawTransactionByHash",
-                        "params": [tx_hash_str],
-                        "id": 1,
-                    });
-                    let raw_response = RPC_CLIENT_BLOCK
-                        .post(rpc_endpoint)
-                        .json(&raw_tx_request)
-                        .send()
-                        .await
-                        .map_err(|e| eyre!("Failed to fetch raw tx: {}", e))?;
-                    let raw_json: serde_json::Value = raw_response
-                        .json()
-                        .await
-                        .map_err(|e| eyre!("Failed to parse raw tx response: {}", e))?;
-                    if let Some(raw_hex) = raw_json["result"].as_str() {
-                        let raw_bytes =
-                            alloy::primitives::hex::decode(raw_hex.trim_start_matches("0x"))
-                                .map_err(|e| eyre!("Failed to decode raw tx hex: {}", e))?;
-                        transactions.push(Bytes::from(raw_bytes));
-                    }
-                }
-            }
-        }
-
-        let base_fee_per_gas = U256::from(MINIMUM_FEE_PER_GAS);
-
-        let header = Header {
-            parent_hash,
-            ommers_hash: EMPTY_OMMER_ROOT_HASH,
-            beneficiary: Default::default(),
-            state_root: EMPTY_ROOT_HASH,
-            transactions_root: tx_root,
-            receipts_root: receipts_root,
-            withdrawals_root: None,
-            logs_bloom,
-            difficulty: Default::default(),
-            number: evm_block_num,
-            gas_limit: gas_limit as u128,
-            gas_used: gas_used as u128,
-            timestamp,
-            mix_hash: Default::default(),
-            nonce: Default::default(),
-            base_fee_per_gas: None,
-            blob_gas_used: None,
-            excess_blob_gas: None,
-            parent_beacon_block_root: None,
-            requests_root: None,
-            extra_data: extra_data.clone(),
-        };
-
-        let exec_payload = ExecutionPayloadV1 {
-            parent_hash,
-            fee_recipient: Default::default(),
-            state_root: EMPTY_ROOT_HASH,
-            receipts_root,
-            logs_bloom,
-            prev_randao: B256::ZERO,
-            block_number: evm_block_num,
-            gas_limit,
-            gas_used,
-            timestamp,
-            extra_data,
-            base_fee_per_gas,
-            block_hash,
-            transactions,
-        };
-
-        Ok((header, exec_payload))
-    }
-
     pub async fn generate_evm_data(
         &mut self,
         parent_hash: FixedBytes<32>,
@@ -831,7 +979,7 @@ impl ProcessingEVMBlock {
             }
 
             let traces = self.block_traces.clone().unwrap_or_default();
-            let mut action_processing_failed = false;
+            let mut action_processing_error = None;
 
             for TransactionTrace::V0(t) in traces {
                 for action in t.action_traces {
@@ -841,50 +989,66 @@ impl ProcessingEVMBlock {
                     {
                         let evm_block_num = (self.block_num - block_delta) as u64;
                         warn!(
-                            "Error handling action in block {} (EVM {}): {}. Will try RPC fallback.",
+                            "Error handling action in block {} (EVM {}): {}. Will stall and retry.",
                             self.block_num, evm_block_num, e
                         );
-                        action_processing_failed = true;
+                        action_processing_error = Some(e.to_string());
                         break;
                     }
                 }
-                if action_processing_failed {
+                if action_processing_error.is_some() {
                     break;
                 }
             }
 
-            // If action processing failed and we have an RPC fallback, fetch the
-            // block directly from the reference chain
-            if action_processing_failed {
-                if let Some(rpc_endpoint) = &self.rpc_fallback_endpoint {
-                    let evm_block_num = (self.block_num - block_delta) as u64;
+            // Do not synthesize a block from eth_getBlockByNumber after an
+            // action parse failure. RPC block payloads do not carry Telos
+            // extra-fields (state diffs, wallet mappings, receipt vector) in
+            // the format reth needs. Stalling and retrying is safer than
+            // committing a payload whose execution sidecar is incomplete.
+            if let Some(error) = action_processing_error {
+                let evm_block_num = (self.block_num - block_delta) as u64;
+                if let Some(tx_hash) = self.missing_receipt_tx_hash.clone() {
                     match self
-                        .fetch_block_from_rpc(rpc_endpoint, evm_block_num, parent_hash)
+                        .validate_tx_membership_with_quorum(evm_block_num, &tx_hash)
                         .await
                     {
-                        Ok(rpc_result) => {
-                            info!(
-                                "Block {} (EVM {}) recovered from RPC after action error (hash={})",
-                                self.block_num, evm_block_num, rpc_result.1.block_hash
+                        TxMembershipValidation::Omitted { reference_hash } => {
+                            warn!(
+                                "Block {} (EVM {}) contains tx {} that canonical RPC quorum does not include. Treating SHIP block as noncanonical.",
+                                self.block_num, evm_block_num, tx_hash
                             );
-                            return Ok(GeneratedEvmData::Canonical {
-                                header: rpc_result.0,
-                                execution_payload: rpc_result.1,
+                            return Ok(GeneratedEvmData::NonCanonical {
+                                evm_block_num: evm_block_num as u32,
+                                local_hash: B256::ZERO,
+                                reference_hash,
                             });
                         }
-                        Err(e) => {
-                            return Err(eyre!(
-                                "Action processing failed and RPC fallback also failed for block {} (EVM {}): {}",
-                                self.block_num, evm_block_num, e
-                            ));
+                        TxMembershipValidation::Included { reference_hash } => {
+                            return Ok(GeneratedEvmData::ValidationUnavailable {
+                                reason: format!(
+                                    "receipt unavailable for tx {} in native block {} (EVM {}), but canonical RPC quorum includes it in block {}; waiting for receipt availability",
+                                    tx_hash, self.block_num, evm_block_num, reference_hash
+                                ),
+                            });
+                        }
+                        TxMembershipValidation::QuorumUnavailable { reason } => {
+                            return Ok(GeneratedEvmData::ValidationUnavailable {
+                                reason: format!(
+                                    "receipt unavailable for tx {} in native block {} (EVM {}), and canonical tx membership could not be verified: {}",
+                                    tx_hash, self.block_num, evm_block_num, reason
+                                ),
+                            });
                         }
                     }
-                } else {
-                    return Err(eyre!(
-                        "Action processing failed for block {} and no RPC fallback configured",
-                        self.block_num
-                    ));
                 }
+
+                return Ok(GeneratedEvmData::ValidationUnavailable {
+                    reason: format!(
+                        "action processing failed for native block {} (EVM {}): {}",
+                        self.block_num, evm_block_num, error
+                    ),
+                });
             }
 
             // This is an exception for the wrong deployment of EVM contract in the testnet on native block #276210867 which caused revision become zero
@@ -994,7 +1158,7 @@ impl ProcessingEVMBlock {
         // Sampling remains config-driven for finalized-only tooling, but
         // pre-Savannah head-tracking overrides the sample rate to 1 before
         // blocks reach this point.
-        if let Some(rpc_endpoint) = &self.rpc_fallback_endpoint {
+        if self.has_canonical_rpc() {
             let our_hash = exec_payload.block_hash;
             let evm_block_num = header.number;
             // Apr 2026 re-enable: the Path 1 disable was based on a wrong
@@ -1023,7 +1187,7 @@ impl ProcessingEVMBlock {
             // txs, that's a silent drop. Log loudly before forcing validation.
             if !has_transactions && !had_no_tx_actions {
                 warn!(
-                    "Block {}: observed {} tx-bearing actions but produced 0 output txs.                      Forcing RPC validation (silent-drop suspected).",
+                    "Block {}: observed {} tx-bearing actions but produced 0 output txs. Forcing RPC validation (silent-drop suspected).",
                     evm_block_num, self.tx_actions_seen
                 );
             }
@@ -1034,79 +1198,23 @@ impl ProcessingEVMBlock {
                 });
             }
 
-            let block_hex = format!("0x{:x}", evm_block_num);
-
-            // Quick hash check against reference RPC
-            // Use a static client to reuse TCP connections across blocks
-            use std::sync::LazyLock;
-            static RPC_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
-                reqwest::Client::builder()
-                    .pool_max_idle_per_host(4)
-                    .build()
-                    .unwrap_or_default()
-            });
-
-            let hash_request = serde_json::json!({
-                "jsonrpc": "2.0",
-                "method": "eth_getBlockByNumber",
-                "params": [block_hex, false],
-                "id": 1,
-            });
-
-            let response = RPC_CLIENT
-                .post(rpc_endpoint)
-                .json(&hash_request)
-                .send()
-                .await
-                .map_err(|e| {
-                    eyre!(
-                        "Block {} canonical hash verification failed; refusing to trust local SHIP data: {}",
-                        evm_block_num,
-                        e
-                    )
-                })?;
-
-            let json_response = response.json::<serde_json::Value>().await.map_err(|e| {
-                eyre!(
-                    "Block {} canonical hash response was not valid JSON; refusing to trust local SHIP data: {}",
-                    evm_block_num,
-                    e
-                )
-            })?;
-
-            let result = json_response.get("result").ok_or_else(|| {
-                eyre!(
-                    "Block {} canonical hash response had no result",
-                    evm_block_num
-                )
-            })?;
-            if result.is_null() {
-                return Err(eyre!(
-                    "Block {} is not available from canonical RPC; refusing to trust local SHIP data",
-                    evm_block_num
-                ));
-            }
-
-            let ref_hash_str = result["hash"].as_str().ok_or_else(|| {
-                eyre!(
-                    "Block {} canonical hash response had no hash",
-                    evm_block_num
-                )
-            })?;
-            let ref_hash = ref_hash_str
-                .parse::<B256>()
-                .map_err(|e| eyre!("Block {} canonical hash was invalid: {}", evm_block_num, e))?;
-
-            if our_hash != ref_hash {
-                warn!(
-                    "Block {} is not canonical: local SHIP hash={} reference={}. Skipping until SHIP provides the canonical fork.",
-                    evm_block_num, our_hash, ref_hash
-                );
-                return Ok(GeneratedEvmData::NonCanonical {
-                    evm_block_num: evm_block_num as u32,
-                    local_hash: our_hash,
-                    reference_hash: ref_hash,
-                });
+            match self.validate_hash_with_quorum(evm_block_num, our_hash).await {
+                HashValidation::Canonical => {}
+                HashValidation::NonCanonical { reference_hash } => {
+                    warn!(
+                        "Block {} is not canonical: local SHIP hash={} reference={}. Skipping until SHIP provides the canonical fork.",
+                        evm_block_num, our_hash, reference_hash
+                    );
+                    return Ok(GeneratedEvmData::NonCanonical {
+                        evm_block_num: evm_block_num as u32,
+                        local_hash: our_hash,
+                        reference_hash,
+                    });
+                }
+                HashValidation::QuorumUnavailable { reason } => {
+                    warn!("{reason}");
+                    return Ok(GeneratedEvmData::ValidationUnavailable { reason });
+                }
             }
         }
 

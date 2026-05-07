@@ -3,7 +3,9 @@ use std::str::FromStr;
 use alloy::primitives::FixedBytes;
 use lazy_static::lazy_static;
 
-use crate::translator::{default_channel_size, TranslatorConfig};
+use crate::translator::{
+    default_channel_size, default_rpc_fallback_retry_interval_secs, TranslatorConfig,
+};
 
 pub const ANTELOPE_EPOCH_MS: u64 = 946684800000;
 pub const ANTELOPE_INTERVAL_MS: u64 = 500;
@@ -35,6 +37,9 @@ lazy_static! {
         block_message_channel_size: default_channel_size(),
         final_message_channel_size: default_channel_size(),
         rpc_fallback_endpoint: None,
+        rpc_fallback_endpoints: vec![],
+        rpc_fallback_quorum: 0,
+        rpc_fallback_retry_interval_secs: default_rpc_fallback_retry_interval_secs(),
         rpc_fallback_sample_every_n: 1,
     };
     pub static ref MAINNET_DEPLOY_CONFIG: TranslatorConfig = TranslatorConfig {
@@ -56,6 +61,9 @@ lazy_static! {
         block_message_channel_size: default_channel_size(),
         final_message_channel_size: default_channel_size(),
         rpc_fallback_endpoint: None,
+        rpc_fallback_endpoints: vec![],
+        rpc_fallback_quorum: 0,
+        rpc_fallback_retry_interval_secs: default_rpc_fallback_retry_interval_secs(),
         rpc_fallback_sample_every_n: 1,
     };
     pub static ref TESTNET_GENESIS_CONFIG: TranslatorConfig = TranslatorConfig {
@@ -77,6 +85,9 @@ lazy_static! {
         block_message_channel_size: default_channel_size(),
         final_message_channel_size: default_channel_size(),
         rpc_fallback_endpoint: None,
+        rpc_fallback_endpoints: vec![],
+        rpc_fallback_quorum: 0,
+        rpc_fallback_retry_interval_secs: default_rpc_fallback_retry_interval_secs(),
         rpc_fallback_sample_every_n: 1,
     };
     // pub static ref TESTNET_DEPLOY_CONFIG: TranslatorConfig = TranslatorConfig {

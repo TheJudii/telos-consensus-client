@@ -78,7 +78,8 @@ async fn generate_block(
             deltas: Some(vec![]),
         },
         skip_events: false,
-        rpc_fallback_endpoint: None,
+        rpc_fallback_endpoints: vec![],
+        rpc_fallback_quorum: 0,
         rpc_fallback_sample_every_n: 1,
         block_timestamp: 0,
     })

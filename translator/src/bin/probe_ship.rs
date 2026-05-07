@@ -43,7 +43,10 @@ async fn main() -> eyre::Result<()> {
         raw_message_channel_size: 1000,
         block_message_channel_size: 1000,
         final_message_channel_size: 1000,
-        rpc_fallback_endpoint: args.rpc_fallback,
+        rpc_fallback_endpoint: args.rpc_fallback.clone(),
+        rpc_fallback_endpoints: args.rpc_fallback.into_iter().collect(),
+        rpc_fallback_quorum: 1,
+        rpc_fallback_retry_interval_secs: 5,
         rpc_fallback_sample_every_n: 1,
     };
     let (tx, mut rx) = mpsc::channel::<TelosEVMBlock>(1000);

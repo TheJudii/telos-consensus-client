@@ -24,6 +24,14 @@ pub fn default_rpc_fallback_sample_every_n() -> u32 {
     1
 }
 
+pub fn default_rpc_fallback_quorum() -> usize {
+    2
+}
+
+pub fn default_rpc_fallback_retry_interval_secs() -> u64 {
+    5
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranslatorConfig {
     pub chain_id: ChainId,
@@ -46,12 +54,102 @@ pub struct TranslatorConfig {
     #[serde(default)]
     pub rpc_fallback_endpoint: Option<String>,
 
+    #[serde(default)]
+    pub rpc_fallback_endpoints: Vec<String>,
+
+    #[serde(default = "default_rpc_fallback_quorum")]
+    pub rpc_fallback_quorum: usize,
+
+    #[serde(default = "default_rpc_fallback_retry_interval_secs")]
+    pub rpc_fallback_retry_interval_secs: u64,
+
     /// Validate every Nth empty block against the reference RPC.
     /// 1 = validate every block (safe production default).
     /// 10 = validate every 10th block (quick-sync; faster but accepts
     /// 90% of empty blocks on trust). Ignored for blocks with transactions.
     #[serde(default = "default_rpc_fallback_sample_every_n")]
     pub rpc_fallback_sample_every_n: u32,
+}
+
+impl TranslatorConfig {
+    pub fn canonical_rpc_endpoints(&self) -> Vec<String> {
+        if !self.rpc_fallback_endpoints.is_empty() {
+            return self.rpc_fallback_endpoints.clone();
+        }
+
+        self.rpc_fallback_endpoint.clone().into_iter().collect()
+    }
+
+    pub fn effective_rpc_fallback_quorum(&self) -> usize {
+        let endpoint_count = self.canonical_rpc_endpoints().len();
+        if endpoint_count == 0 {
+            0
+        } else {
+            self.rpc_fallback_quorum.clamp(1, endpoint_count)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config_with_rpc(
+        rpc_fallback_endpoint: Option<String>,
+        rpc_fallback_endpoints: Vec<String>,
+        rpc_fallback_quorum: usize,
+    ) -> TranslatorConfig {
+        TranslatorConfig {
+            chain_id: ChainId(40),
+            evm_deploy_block: None,
+            evm_start_block: 0,
+            evm_stop_block: None,
+            prev_hash: String::new(),
+            validate_hash: None,
+            http_endpoint: String::new(),
+            ship_endpoint: String::new(),
+            raw_message_channel_size: default_channel_size(),
+            block_message_channel_size: default_channel_size(),
+            final_message_channel_size: default_channel_size(),
+            rpc_fallback_endpoint,
+            rpc_fallback_endpoints,
+            rpc_fallback_quorum,
+            rpc_fallback_retry_interval_secs: default_rpc_fallback_retry_interval_secs(),
+            rpc_fallback_sample_every_n: default_rpc_fallback_sample_every_n(),
+        }
+    }
+
+    #[test]
+    fn single_endpoint_fallback_remains_backward_compatible() {
+        let config = config_with_rpc(Some("https://rpc-a.example".into()), vec![], 2);
+
+        assert_eq!(
+            config.canonical_rpc_endpoints(),
+            vec!["https://rpc-a.example".to_string()]
+        );
+        assert_eq!(config.effective_rpc_fallback_quorum(), 1);
+    }
+
+    #[test]
+    fn endpoint_list_takes_precedence_and_clamps_quorum() {
+        let config = config_with_rpc(
+            Some("https://legacy.example".into()),
+            vec![
+                "https://rpc-a.example".into(),
+                "https://rpc-b.example".into(),
+            ],
+            3,
+        );
+
+        assert_eq!(
+            config.canonical_rpc_endpoints(),
+            vec![
+                "https://rpc-a.example".to_string(),
+                "https://rpc-b.example".to_string()
+            ]
+        );
+        assert_eq!(config.effective_rpc_fallback_quorum(), 2);
+    }
 }
 
 pub struct Translator {

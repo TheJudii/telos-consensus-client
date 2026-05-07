@@ -25,6 +25,8 @@ pub async fn raw_deserializer(
     let mut last_log = Instant::now();
     let mut unlogged_blocks = 0;
     let block_delta = config.chain_id.block_delta();
+    let rpc_fallback_endpoints = config.canonical_rpc_endpoints();
+    let rpc_fallback_quorum = config.effective_rpc_fallback_quorum();
     let mut rpc_fallback_sample_every_n = config.rpc_fallback_sample_every_n;
 
     // TODO: maybe get this working as an ABI again?
@@ -55,10 +57,16 @@ pub async fn raw_deserializer(
 
         match ship_result {
             ShipResult::GetStatusResultV0(r) => {
-                if config.rpc_fallback_endpoint.is_none() {
+                if rpc_fallback_endpoints.is_empty() || rpc_fallback_quorum == 0 {
                     return Err(eyre!(
-                        "pre-Savannah head-tracking mode requires rpc_fallback_endpoint so every SHIP block can be checked before reth sees it"
+                        "pre-Savannah head-tracking mode requires rpc_fallback_endpoints so every SHIP block can be checked before reth sees it"
                     ));
+                }
+                if config.rpc_fallback_endpoints.is_empty() && config.rpc_fallback_endpoint.is_some()
+                {
+                    warn!(
+                        "rpc_fallback_endpoint is deprecated for pre-Savannah production mode; using it as a single endpoint with quorum=1"
+                    );
                 }
                 rpc_fallback_sample_every_n = if config.rpc_fallback_sample_every_n != 1 {
                     warn!(
@@ -78,6 +86,11 @@ pub async fn raw_deserializer(
                 info!(
                     "GetStatusResultV0 head: {:?} last_irreversible: {:?}",
                     r.head.block_num, r.last_irreversible.block_num
+                );
+                info!(
+                    "pre-Savannah head-tracking enabled: irreversible_only=false, validating every block with {} RPC endpoint(s), quorum={}",
+                    rpc_fallback_endpoints.len(),
+                    rpc_fallback_quorum
                 );
                 let request = &ShipRequest::GetBlocks(GetBlocksRequestV0 {
                     start_block_num,
@@ -125,7 +138,8 @@ pub async fn raw_deserializer(
                         lib_hash: r.last_irreversible.block_id,
                         result: r.clone(),
                         skip_events,
-                        rpc_fallback_endpoint: config.rpc_fallback_endpoint.clone(),
+                        rpc_fallback_endpoints: rpc_fallback_endpoints.clone(),
+                        rpc_fallback_quorum,
                         rpc_fallback_sample_every_n,
                         block_timestamp,
                     });

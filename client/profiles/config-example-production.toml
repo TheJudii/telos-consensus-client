@@ -41,8 +41,15 @@ block_checkpoint_interval = 5000
 maximum_sync_range = 500000000
 latest_blocks_in_db_num = 10000
 
-# Reference RPC for fallback + sampling validation
-rpc_fallback_endpoint = "https://rpc.testnet.telos.net"
+# Independent reference RPCs for receipt fallback + canonical hash validation.
+# Use endpoints backed by different infrastructure/operators where possible.
+rpc_fallback_endpoints = [
+  "https://rpc.testnet.telos.net",
+  "https://REPLACE_WITH_SECOND_INDEPENDENT_RPC",
+  "https://REPLACE_WITH_THIRD_INDEPENDENT_RPC",
+]
+rpc_fallback_quorum = 2
+rpc_fallback_retry_interval_secs = 5
 
 # REQUIRED FOR HEAD-TRACKING: validate every block.
 rpc_fallback_sample_every_n = 1

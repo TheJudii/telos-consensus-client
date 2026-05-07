@@ -1,6 +1,11 @@
 use clap::Parser;
 use serde::Deserialize;
-use telos_translator_rs::{translator::TranslatorConfig, types::translator_types::ChainId};
+use telos_translator_rs::{
+    translator::{
+        default_rpc_fallback_quorum, default_rpc_fallback_retry_interval_secs, TranslatorConfig,
+    },
+    types::translator_types::ChainId,
+};
 
 /// Telos Consensus Client CLI Arguments
 #[derive(Parser, Debug, Clone)]
@@ -73,6 +78,18 @@ pub struct AppConfig {
     /// (Optional) RPC endpoint to fallback to when SHIP console output is missing
     pub rpc_fallback_endpoint: Option<String>,
 
+    /// RPC endpoints used for canonical cross-validation.
+    #[serde(default)]
+    pub rpc_fallback_endpoints: Vec<String>,
+
+    /// Number of RPC endpoints that must agree on the canonical hash.
+    #[serde(default = "default_rpc_fallback_quorum")]
+    pub rpc_fallback_quorum: usize,
+
+    /// Delay before retrying a block when endpoint quorum is unavailable.
+    #[serde(default = "default_rpc_fallback_retry_interval_secs")]
+    pub rpc_fallback_retry_interval_secs: u64,
+
     /// Validate every Nth empty block against the reference RPC.
     /// Defaults to 1 (validate every block; safe production default).
     /// Set to 10 in quick-sync profile for 10x speed at the cost of
@@ -97,6 +114,9 @@ impl From<&AppConfig> for TranslatorConfig {
             block_message_channel_size: 1000,
             final_message_channel_size: 1000,
             rpc_fallback_endpoint: config.rpc_fallback_endpoint.clone(),
+            rpc_fallback_endpoints: config.rpc_fallback_endpoints.clone(),
+            rpc_fallback_quorum: config.rpc_fallback_quorum,
+            rpc_fallback_retry_interval_secs: config.rpc_fallback_retry_interval_secs,
             rpc_fallback_sample_every_n: config.rpc_fallback_sample_every_n.unwrap_or(1),
         }
     }

@@ -16,7 +16,10 @@ use reth_telos_rpc_engine_api::structs::{
 };
 use std::collections::HashMap;
 use std::str::FromStr;
-use tokio::{sync::mpsc, time::Instant};
+use tokio::{
+    sync::mpsc,
+    time::{sleep, Duration, Instant},
+};
 use tracing::{debug, error, info, warn};
 
 struct BlockMap {
@@ -135,7 +138,10 @@ pub async fn final_processor(
 
     let mut block_map = BlockMap::new(config_parent_hash);
 
-    while let Some(mut block) = rx.recv().await {
+    let rpc_fallback_retry_interval =
+        Duration::from_secs(config.rpc_fallback_retry_interval_secs.max(1));
+
+    'blocks: while let Some(block) = rx.recv().await {
         let block_num = block.block_num;
         if &block_num > stop_block {
             break;
@@ -146,31 +152,42 @@ pub async fn final_processor(
             .parent_hash(&block)
             .expect("Block parent hash can be found");
 
-        let generated = block
-            .generate_evm_data(parent_hash, block_delta, &native_to_evm_cache)
-            .await?;
-
-        let (header, exec_payload) = match generated {
-            GeneratedEvmData::Canonical {
-                header,
-                execution_payload,
-            } => (header, execution_payload),
-            GeneratedEvmData::NonCanonical {
-                evm_block_num,
-                local_hash,
-                reference_hash,
-            } => {
-                warn!(
-                    "Skipping noncanonical SHIP block {} (EVM {}): local_hash={} reference_hash={}",
-                    block_num, evm_block_num, local_hash, reference_hash
-                );
-                block_map.record_skipped_fork_block(
-                    block.block_hash.as_string(),
-                    block_num,
+        let (block, header, exec_payload) = loop {
+            let mut candidate = block.clone();
+            match candidate
+                .generate_evm_data(parent_hash, block_delta, &native_to_evm_cache)
+                .await?
+            {
+                GeneratedEvmData::Canonical {
+                    header,
+                    execution_payload,
+                } => break (candidate, header, execution_payload),
+                GeneratedEvmData::NonCanonical {
+                    evm_block_num,
                     local_hash,
-                    block.lib_num,
-                );
-                continue;
+                    reference_hash,
+                } => {
+                    warn!(
+                        "Skipping noncanonical SHIP block {} (EVM {}): local_hash={} reference_hash={}",
+                        block_num, evm_block_num, local_hash, reference_hash
+                    );
+                    block_map.record_skipped_fork_block(
+                        block.block_hash.as_string(),
+                        block_num,
+                        local_hash,
+                        block.lib_num,
+                    );
+                    continue 'blocks;
+                }
+                GeneratedEvmData::ValidationUnavailable { reason } => {
+                    warn!(
+                        "Canonical validation unavailable for SHIP block {}: {}. Retrying in {}s.",
+                        block_num,
+                        reason,
+                        rpc_fallback_retry_interval.as_secs()
+                    );
+                    sleep(rpc_fallback_retry_interval).await;
+                }
             }
         };
 
@@ -413,7 +430,8 @@ mod tests {
             lib_hash: checksum(0xee),
             result: GetBlocksResultV0::default(),
             skip_events: false,
-            rpc_fallback_endpoint: Some("http://127.0.0.1:8888".to_string()),
+            rpc_fallback_endpoints: vec!["http://127.0.0.1:8888".to_string()],
+            rpc_fallback_quorum: 1,
             rpc_fallback_sample_every_n: 1,
             block_timestamp: 0,
         })
