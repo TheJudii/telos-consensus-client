@@ -1,4 +1,4 @@
-use eyre::Result;
+use eyre::{eyre, Result};
 use futures_util::stream::SplitStream;
 use futures_util::StreamExt;
 use tokio::net::TcpStream;
@@ -18,7 +18,12 @@ pub async fn ship_reader(
         // Read the websocket
         let message = tokio::select! {
             message = ws_rx.next() => message,
-            _ = stop_rx.recv() => break
+            shutdown = stop_rx.recv() => {
+                if shutdown.is_some() {
+                    break;
+                }
+                return Err(eyre!("shutdown channel closed before SHIP reader stopped"));
+            }
         };
 
         counter += 1;
@@ -31,16 +36,18 @@ pub async fn ship_reader(
                 }
                 if let Err(e) = raw_ds_tx.send(msg.into_data()).await {
                     error!("Receiver dropped {:?}", e);
-                    break;
+                    return Err(eyre!(
+                        "raw deserializer dropped before SHIP message could be sent: {e}"
+                    ));
                 }
                 debug!("Sent message {counter} to raw ds pool...");
             }
             Some(Err(e)) => {
                 error!("Error receiving message: {}", e);
-                break;
+                return Err(eyre!("error receiving SHIP websocket message: {e}"));
             }
             None => {
-                break;
+                return Err(eyre!("SHIP websocket closed"));
             }
         }
     }

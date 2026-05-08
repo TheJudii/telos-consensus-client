@@ -138,6 +138,19 @@ impl ConsensusClient {
             .map(|block| block.header.number.as_u32())
     }
 
+    pub fn latest_executor_number(&self) -> Option<u32> {
+        self.latest_executor_block
+            .as_ref()
+            .map(|block| block.header.number.as_u32())
+    }
+
+    pub async fn executor_block_by_number(&self, number: u32) -> Result<Option<Block>, Error> {
+        self.execution_api
+            .get_block_by_number(number.into())
+            .await
+            .map_err(Error::from)
+    }
+
     pub fn sync_range(&self) -> Option<u32> {
         self.latest_evm_number()?
             .checked_sub(self.config.evm_start_block)

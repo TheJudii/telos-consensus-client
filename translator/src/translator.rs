@@ -194,10 +194,10 @@ impl Translator {
 
         let (ws_stream, _) = connect_async(&self.config.ship_endpoint)
             .await
-            .map_err(|_| {
+            .map_err(|error| {
                 eyre!(
-                    "Failed to connect to ship at endpoint {}",
-                    &self.config.ship_endpoint
+                    "Failed to connect to ship at endpoint {}: {error}",
+                    &self.config.ship_endpoint,
                 )
             })?;
 

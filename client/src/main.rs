@@ -63,10 +63,21 @@ async fn main() -> Result<()> {
         .init();
 
     let retry_interval = config.retry_interval.unwrap_or(8000u64);
-    let max_retries = config.max_retry.unwrap_or(8u8).as_usize();
-    let retry_strategy = FixedInterval::from_millis(retry_interval).take(max_retries);
+    let run_result = if let Some(max_retry) = config.max_retry {
+        Retry::spawn(
+            FixedInterval::from_millis(retry_interval).take(max_retry.as_usize()),
+            RunClientAction::new(args, config),
+        )
+        .await
+    } else {
+        Retry::spawn(
+            FixedInterval::from_millis(retry_interval),
+            RunClientAction::new(args, config),
+        )
+        .await
+    };
 
-    if let Err(error) = Retry::spawn(retry_strategy, RunClientAction::new(args, config)).await {
+    if let Err(error) = run_result {
         error!("Stopping consensus client, run failed!");
         return Err(error).wrap_err("Stopping consensus client, run failed!");
     }

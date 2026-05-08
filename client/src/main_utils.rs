@@ -96,11 +96,12 @@ pub async fn build_consensus_client(
         info!("Last stored LIB: {lib_number}");
     }
 
-    let latest_number = lib
-        .as_ref()
-        .map(|lib| lib.number + client.config.chain_id.block_delta())
-        .zip(client.latest_evm_number())
-        .map(|(lib, latest)| cmp::min(lib, latest));
+    let latest_number = client.latest_executor_number().or_else(|| {
+        lib.as_ref()
+            .map(|lib| lib.number + client.config.chain_id.block_delta())
+            .zip(client.latest_evm_number())
+            .map(|(lib, latest)| cmp::min(lib, latest))
+    });
 
     let last_checked = match latest_number {
         Some(latest_number) => client.db.get_block_or_prev(latest_number)?,
@@ -109,9 +110,34 @@ pub async fn build_consensus_client(
 
     if let Some(last_checked) = last_checked.as_ref() {
         info!(
-            "Last stored final block: {}, {}",
+            "Last stored resume block: {}, {}",
             last_checked.number, last_checked.hash
         );
+
+        match client.executor_block_by_number(last_checked.number).await? {
+            Some(executor_block) if executor_block.header.hash.to_string() == last_checked.hash => {
+                info!(
+                    "Resume block {} verified against executor",
+                    last_checked.number
+                );
+            }
+            Some(executor_block) => {
+                warn!(
+                    "Stored resume block {} hash {} does not match executor hash {}; refusing to resume from possibly stale consensus DB",
+                    last_checked.number,
+                    last_checked.hash,
+                    executor_block.header.hash
+                );
+                return Err(Error::ExecutorHashMismatch);
+            }
+            None => {
+                warn!(
+                    "Stored resume block {} is not available from executor; refusing to resume from possibly stale consensus DB",
+                    last_checked.number
+                );
+                return Err(Error::ExecutorHashMismatch);
+            }
+        }
     }
 
     if let Some(last_checked) = last_checked {

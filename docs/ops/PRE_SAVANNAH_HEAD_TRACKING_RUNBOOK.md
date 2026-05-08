@@ -40,6 +40,17 @@ compatibility mode, but that is not recommended for production.
 - `contains tx ... canonical RPC quorum does not include`: the SHIP block is a
   fork block with a transaction that is not canonical; the block is skipped.
 
+## Restart/Resume Behavior
+
+- A SHIP websocket close/reset is treated as a run failure, not a clean stop.
+- If `max_retry` is unset, the client retries indefinitely after
+  `retry_interval` milliseconds. Set `max_retry` only when an external
+  supervisor is responsible for long-lived restarts.
+- On restart, the client resumes from the latest stored block that is at or
+  below reth's current head and verifies that stored hash against reth before
+  requesting SHIP data. A mismatch is fatal and should be investigated rather
+  than replayed through.
+
 ## Reth Settings
 
 Use the matching `telos-reth-v2` branch. The Telos binary defaults are set before
@@ -61,6 +72,8 @@ state auditable and protect operators who accidentally run a different binary.
 3. Start consensus with 2-of-3 RPC quorum and `rpc_fallback_sample_every_n = 1`.
 4. Sync to tip and compare `eth_getBlockByNumber("latest", false)` against at
    least two independent public RPCs for the last 1,000 blocks.
-5. Soak at head for 24 hours before widening operator rollout.
-6. Alert on repeated quorum stalls, repeated receipt-included stalls, or any
-   consensus process exit.
+5. Restart nodeos once and confirm consensus retries, reconnects, and resumes
+   near reth head rather than replaying from LIB.
+6. Soak at head for 24 hours before widening operator rollout.
+7. Alert on repeated quorum stalls, repeated receipt-included stalls, or any
+   consensus process exit that does not recover automatically.
