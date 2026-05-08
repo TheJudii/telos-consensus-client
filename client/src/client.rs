@@ -159,6 +159,10 @@ impl ConsensusClient {
     pub async fn run(mut self, mut rx: mpsc::Receiver<TelosEVMBlock>) -> Result<(), Error> {
         let mut batch = vec![];
         let chain_id = &self.config.chain_id;
+        let batch_size = self.config.batch_size.max(1);
+        if self.config.batch_size == 0 {
+            warn!("Configured batch_size=0; using batch_size=1 to keep Engine API progress live");
+        }
         let mut lib: data::Block = self.db.get_lib()?.unwrap_or_default();
         let mut last_lib_hash: Option<B256> = None;
 
@@ -243,9 +247,10 @@ impl ConsensusClient {
 
             batch.push(block);
 
-            // if LIB is less or equal than current block batch size is 1 or more blocks
-            // if LIB is greater than current block send in batches
-            let flush = !block_is_final || block_is_lib || batch.len() == self.config.batch_size;
+            // Flush reversible head blocks immediately, and cap finalized catch-up
+            // batches so a seeded node cannot buffer an unbounded backlog before
+            // making Engine API progress.
+            let flush = !block_is_final || block_is_lib || batch.len() >= batch_size;
 
             if !flush {
                 continue;
@@ -295,21 +300,33 @@ impl ConsensusClient {
             match serde_json::to_string(&block.extra_fields) {
                 Ok(json) => {
                     if json.is_empty() {
-                        warn!("extra_fields serialized to empty string for block {:?}", block.block_hash);
+                        warn!(
+                            "extra_fields serialized to empty string for block {:?}",
+                            block.block_hash
+                        );
                         continue;
                     }
                     if let Err(e) = std::fs::write(&tmp_path, &json) {
-                        warn!("extra_fields tmp write failed for {:?}: {}", block.block_hash, e);
+                        warn!(
+                            "extra_fields tmp write failed for {:?}: {}",
+                            block.block_hash, e
+                        );
                         let _ = std::fs::remove_file(&tmp_path);
                         continue;
                     }
                     if let Err(e) = std::fs::rename(&tmp_path, &path) {
-                        warn!("extra_fields rename failed for {:?}: {}", block.block_hash, e);
+                        warn!(
+                            "extra_fields rename failed for {:?}: {}",
+                            block.block_hash, e
+                        );
                         let _ = std::fs::remove_file(&tmp_path);
                     }
                 }
                 Err(e) => {
-                    warn!("extra_fields serialize failed for {:?}: {}", block.block_hash, e);
+                    warn!(
+                        "extra_fields serialize failed for {:?}: {}",
+                        block.block_hash, e
+                    );
                 }
             }
         }
@@ -375,9 +392,7 @@ impl ConsensusClient {
             // Valid, Invalid, Accepted, Syncing
             if fork_choice_updated.is_syncing() {
                 // SYNCING is normal during initial sync - reth is catching up, just log and continue
-                info!(
-                    "Fork choice update status is SYNCING (reth still syncing, continuing...)",
-                );
+                info!("Fork choice update status is SYNCING (reth still syncing, continuing...)",);
             } else if fork_choice_updated.is_invalid() {
                 info!(
                     "Fork choice update status is {} ",

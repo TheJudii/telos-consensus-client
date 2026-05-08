@@ -26,7 +26,9 @@ jwt_secret = "REPLACE_WITH_REAL_JWT_SECRET"
 ship_endpoint = "ws://localhost:18081"
 chain_endpoint = "http://localhost:18888"
 
-batch_size = 10000
+# Larger batches reduce Engine API calls during finalized-only catch-up, but
+# keep this bounded so quick-sync does not hide progress for long stretches.
+batch_size = 1000
 
 data_path = "/data/telos-consensus-client/quick-sync/db"
 block_checkpoint_interval = 5000

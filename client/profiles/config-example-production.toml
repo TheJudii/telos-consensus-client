@@ -32,8 +32,12 @@ jwt_secret = "REPLACE_WITH_REAL_JWT_SECRET"
 ship_endpoint = "ws://localhost:18081"
 chain_endpoint = "http://localhost:18888"
 
-# Engine-API batch flush cadence
-batch_size = 10000
+# Engine-API batch flush cadence.
+# Keep this intentionally modest for pre-Savannah head-tracking: seeded
+# nodes may need to replay thousands of finalized blocks before reaching the
+# reversible head, and very large batches delay reth progress while increasing
+# memory pressure.
+batch_size = 250
 
 # Local DB
 data_path = "/data/telos-consensus-client/production/db"
