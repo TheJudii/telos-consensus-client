@@ -3,7 +3,6 @@ use antelope::chain::asset::{Asset, Symbol};
 use antelope::chain::checksum::{Checksum160, Checksum256};
 use antelope::chain::name::Name;
 use antelope::util::hex_to_bytes;
-use reth_primitives::BloomInput::Raw;
 use telos_translator_rs::transaction::TelosEVMTransaction;
 use telos_translator_rs::types::evm_types::{
     PrintedReceipt, RawAction, TransferAction, WithdrawAction,
@@ -94,6 +93,37 @@ async fn test_single_zero_sig() {
         ).await.unwrap();
 
     println!("{:#?}", trx);
+}
+
+#[tokio::test]
+async fn test_unsigned_raw_action_hash_matches_canonical_rpc() {
+    let trx = TelosEVMTransaction::from_raw_action(
+        40,
+        0,
+        Checksum256::from_bytes(&hex_to_bytes(
+            "1bde671a8c6cf7b64c580f3300ae48f01df37ee34c64e0a7280752338ab8ad15",
+        ))
+        .unwrap(),
+        RawAction {
+            ram_payer: Name::new_from_str("moayadtayah1"),
+            tx: hex_to_bytes(
+                "ef0d8604c68cd444de8252089405e0a8826b9abf24c96688e6adf2856377e645838a01376fe415af7b20000080808080",
+            ),
+            estimate_gas: false,
+            sender: Some(
+                Checksum160::from_hex("ba79279dc80e8566fadcde562d0e54ef4e9fceca")
+                    .unwrap(),
+            ),
+        },
+        PrintedReceipt::default(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        trx.hash().to_string(),
+        "0x073ef2e35c3c5b90c26ffc3ffe4e02f6c70df7c38764e9f48d67c9d37389dd87"
+    );
 }
 
 #[tokio::test]

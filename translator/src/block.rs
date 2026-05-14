@@ -346,6 +346,20 @@ impl ProcessingEVMBlock {
         !self.rpc_fallback_endpoints.is_empty() && self.effective_rpc_quorum() > 0
     }
 
+    async fn raw_action_transaction_hash(&self, raw: &RawAction) -> eyre::Result<String> {
+        let transaction = TelosEVMTransaction::from_raw_action(
+            self.chain_id,
+            self.transactions.len(),
+            self.block_hash,
+            raw.clone(),
+            PrintedReceipt::default(),
+        )
+        .await
+        .map_err(|e| eyre!("failed to build raw action transaction hash: {e}"))?;
+
+        Ok(format!("0x{}", hex::encode(transaction.hash().as_slice())))
+    }
+
     async fn fetch_receipt_from_rpc(&self, tx_hash: &str) -> eyre::Result<Option<RpcReceipt>> {
         if self.rpc_fallback_endpoints.is_empty() {
             return Err(eyre!("No RPC fallback endpoints configured"));
@@ -699,6 +713,7 @@ impl ProcessingEVMBlock {
         &mut self,
         action: Box<dyn BasicTrace + Send>,
         native_to_evm_cache: &NameToAddressCache,
+        evm_block_num: u64,
     ) -> eyre::Result<()> {
         let action_name = action.action_name();
         let action_account = action.action_account();
@@ -742,9 +757,16 @@ impl ProcessingEVMBlock {
                 None => {
                     // Try RPC fallback if configured
                     if self.has_canonical_rpc() {
-                        // Compute tx hash from raw tx bytes
-                        let tx_hash = keccak256(&raw.tx);
-                        let tx_hash_str = format!("0x{}", hex::encode(tx_hash));
+                        let raw_payload_hash = keccak256(&raw.tx);
+                        let raw_payload_hash_str =
+                            format!("0x{}", hex::encode(raw_payload_hash));
+                        let tx_hash_str = self.raw_action_transaction_hash(&raw).await?;
+                        if tx_hash_str != raw_payload_hash_str {
+                            debug!(
+                                "Raw action payload hash {} translated to EVM transaction hash {} in block {}",
+                                raw_payload_hash_str, tx_hash_str, self.block_num
+                            );
+                        }
 
                         match self.fetch_receipt_from_rpc(&tx_hash_str).await {
                             Ok(Some(rpc_receipt)) => {
@@ -760,27 +782,49 @@ impl ProcessingEVMBlock {
                                 )
                             }
                             Ok(None) => {
-                                // DO NOT silently skip. Earlier versions assumed
-                                // "RPC returned null => prod skipped it" but this
-                                // is wrong in the face of RPC replica lag or eventual
-                                // consistency (observed on mainnet-quick at block
-                                // 463,899,714: tx 0x53e1e7cf returned null during
-                                // initial sync but exists on-chain). Silent skip
-                                // produces an empty-block hash that diverges from
-                                // canonical and gets committed to reth without
-                                // verification when the block happens to not be
-                                // a sample block. Fail loud instead; the outer
-                                // handler checks canonical tx membership before
-                                // deciding whether to skip the fork block or retry.
                                 warn!(
                                     "Single-tx receipt RPC returned null for tx {} in block {}. Checking canonical tx membership before retrying.",
                                     tx_hash_str, self.block_num
                                 );
-                                self.missing_receipt_tx_hash = Some(tx_hash_str.clone());
-                                return Err(eyre::eyre!(
-                                    "Single-tx receipt null for tx {} in block {} (likely RPC replica lag or noncanonical SHIP fork)",
-                                    tx_hash_str, self.block_num
-                                ));
+
+                                match self
+                                    .validate_tx_membership_with_quorum(
+                                        evm_block_num,
+                                        &tx_hash_str,
+                                    )
+                                    .await
+                                {
+                                    TxMembershipValidation::Included { reference_hash } => {
+                                        self.missing_receipt_tx_hash = Some(tx_hash_str.clone());
+                                        return Err(eyre::eyre!(
+                                            "receipt unavailable for tx {} in native block {} (EVM {}), but canonical RPC quorum includes it in block {}; waiting for receipt availability",
+                                            tx_hash_str,
+                                            self.block_num,
+                                            evm_block_num,
+                                            reference_hash
+                                        ));
+                                    }
+                                    TxMembershipValidation::Omitted { reference_hash } => {
+                                        warn!(
+                                            "Canonical RPC quorum omits tx {} from native block {} (EVM {}, reference block {}). Skipping this raw action and forcing block-hash validation.",
+                                            tx_hash_str,
+                                            self.block_num,
+                                            evm_block_num,
+                                            reference_hash
+                                        );
+                                        return Ok(());
+                                    }
+                                    TxMembershipValidation::QuorumUnavailable { reason } => {
+                                        self.missing_receipt_tx_hash = Some(tx_hash_str.clone());
+                                        return Err(eyre::eyre!(
+                                            "receipt unavailable for tx {} in native block {} (EVM {}), and canonical tx membership could not be verified: {}",
+                                            tx_hash_str,
+                                            self.block_num,
+                                            evm_block_num,
+                                            reason
+                                        ));
+                                    }
+                                }
                             }
                             Err(e) => {
                                 warn!(
@@ -980,14 +1024,14 @@ impl ProcessingEVMBlock {
 
             let traces = self.block_traces.clone().unwrap_or_default();
             let mut action_processing_error = None;
+            let evm_block_num = (self.block_num - block_delta) as u64;
 
             for TransactionTrace::V0(t) in traces {
                 for action in t.action_traces {
                     if let Err(e) = self
-                        .handle_action(Box::new(action), native_to_evm_cache)
+                        .handle_action(Box::new(action), native_to_evm_cache, evm_block_num)
                         .await
                     {
-                        let evm_block_num = (self.block_num - block_delta) as u64;
                         warn!(
                             "Error handling action in block {} (EVM {}): {}. Will stall and retry.",
                             self.block_num, evm_block_num, e
@@ -1014,14 +1058,11 @@ impl ProcessingEVMBlock {
                         .await
                     {
                         TxMembershipValidation::Omitted { reference_hash } => {
-                            warn!(
-                                "Block {} (EVM {}) contains tx {} that canonical RPC quorum does not include. Treating SHIP block as noncanonical.",
-                                self.block_num, evm_block_num, tx_hash
-                            );
-                            return Ok(GeneratedEvmData::NonCanonical {
-                                evm_block_num: evm_block_num as u32,
-                                local_hash: B256::ZERO,
-                                reference_hash,
+                            return Ok(GeneratedEvmData::ValidationUnavailable {
+                                reason: format!(
+                                    "action processing failed for tx {} in native block {} (EVM {}), and canonical RPC quorum omits it from reference block {}; refusing to synthesize a fork marker after partial processing",
+                                    tx_hash, self.block_num, evm_block_num, reference_hash
+                                ),
                             });
                         }
                         TxMembershipValidation::Included { reference_hash } => {

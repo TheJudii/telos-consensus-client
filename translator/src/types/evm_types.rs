@@ -11,7 +11,7 @@ use antelope::serializer::Encoder;
 use antelope::util::hex_to_bytes;
 use antelope::StructPacker;
 use serde::{Deserialize, Deserializer, Serialize};
-use tracing::warn;
+use tracing::{debug, warn};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, StructPacker)]
 pub struct RawAction {
@@ -206,7 +206,10 @@ impl PrintedReceipt {
             // consoles that contain binary data that resolved to text without
             // the expected RCPT{{...}}RCPT marker. The caller should decide
             // whether to hard-fail or skip.
-            warn!("Start pattern not found in console output (console_len={}).", console.len());
+            debug!(
+                "Start pattern not found in console output (console_len={}).",
+                console.len()
+            );
             None
         }
     }

@@ -37,8 +37,9 @@ compatibility mode, but that is not recommended for production.
 - `receipt unavailable ... canonical RPC quorum includes it`: the tx is in the
   canonical block but receipts are not yet consistently available; the block is
   retried.
-- `contains tx ... canonical RPC quorum does not include`: the SHIP block is a
-  fork block with a transaction that is not canonical; the block is skipped.
+- `Canonical RPC quorum omits tx ...`: the raw action is omitted from the
+  canonical EVM block. Consensus skips that action and still validates the final
+  block hash before forwarding anything to reth.
 
 ## Restart/Resume Behavior
 

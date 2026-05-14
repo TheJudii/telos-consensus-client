@@ -69,13 +69,13 @@ impl BlockMap {
         &mut self,
         native_hash: String,
         native_block_num: u32,
-        evm_hash: B256,
+        local_hash: B256,
         lib_num: u32,
     ) {
-        self.remember_hash(native_hash.clone(), native_block_num, evm_hash);
+        self.remember_hash(native_hash.clone(), native_block_num, local_hash);
         self.prev_block_num = Some(native_block_num);
         self.last_ship_hash = Some(native_hash);
-        self.parent_hash = evm_hash;
+        self.parent_hash = local_hash;
         self.prune_final_hashes(lib_num);
     }
 
@@ -438,26 +438,26 @@ mod tests {
     }
 
     #[test]
-    fn skipped_fork_block_can_parent_losing_child() {
-        let losing_native = checksum(0x22);
-        let losing_evm = evm_hash(0x33);
+    fn skipped_fork_block_parents_descendant_on_local_hash() {
+        let skipped_native = checksum(0x22);
+        let local_evm = evm_hash(0x33);
 
         let mut map = BlockMap::new(evm_hash(0x11));
-        map.record_skipped_fork_block(losing_native.as_string(), 101, losing_evm, 90);
+        map.record_skipped_fork_block(skipped_native.as_string(), 101, local_evm, 90);
 
-        let losing_child = processing_block(102, checksum(0x44), Some(losing_native));
-        assert_eq!(map.parent_hash(&losing_child), Some(losing_evm));
+        let child = processing_block(102, checksum(0x44), Some(skipped_native));
+        assert_eq!(map.parent_hash(&child), Some(local_evm));
     }
 
     #[test]
     fn sequential_branch_switch_uses_prev_native_hash_mapping() {
-        let losing_native = checksum(0x22);
+        let skipped_native = checksum(0x22);
         let canonical_native = checksum(0x55);
-        let losing_evm = evm_hash(0x33);
+        let skipped_local_evm = evm_hash(0x33);
         let canonical_evm = evm_hash(0x66);
 
         let mut map = BlockMap::new(evm_hash(0x11));
-        map.record_skipped_fork_block(losing_native.as_string(), 101, losing_evm, 90);
+        map.record_skipped_fork_block(skipped_native.as_string(), 101, skipped_local_evm, 90);
         map.remember_hash(canonical_native.as_string(), 101, canonical_evm);
 
         let canonical_child = processing_block(102, checksum(0x77), Some(canonical_native));
