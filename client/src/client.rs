@@ -227,17 +227,38 @@ impl ConsensusClient {
 
                 if let Some(evm_block) = evm_block {
                     if evm_block.header.hash != block_hash {
-                        error!(
-                            "CHECK-RANGE MISMATCH at block {}: consensus_hash={:?} reth_stored_hash={:?} reth_parent_hash={:?} reth_extra_data={:?}",
-                            block_num,
-                            block_hash,
-                            evm_block.header.hash,
-                            evm_block.header.parent_hash,
-                            evm_block.header.extra_data,
-                        );
-                        return Err(Error::ExecutorHashMismatch);
+                        let is_same_parent_head_sibling = self
+                            .latest_executor_block
+                            .as_ref()
+                            .map(|latest| {
+                                latest.header.number == block_num as u64
+                                    && latest.header.hash == evm_block.header.hash
+                                    && evm_block.header.parent_hash == block.header.parent_hash
+                            })
+                            .unwrap_or(false);
+
+                        if is_same_parent_head_sibling {
+                            warn!(
+                                "CHECK-RANGE HEAD SIBLING at block {}: consensus_hash={:?} reth_stored_hash={:?} parent_hash={:?}; submitting canonical sibling and relying on forkchoice to adopt it",
+                                block_num,
+                                block_hash,
+                                evm_block.header.hash,
+                                evm_block.header.parent_hash,
+                            );
+                        } else {
+                            error!(
+                                "CHECK-RANGE MISMATCH at block {}: consensus_hash={:?} reth_stored_hash={:?} reth_parent_hash={:?} reth_extra_data={:?}",
+                                block_num,
+                                block_hash,
+                                evm_block.header.hash,
+                                evm_block.header.parent_hash,
+                                evm_block.header.extra_data,
+                            );
+                            return Err(Error::ExecutorHashMismatch);
+                        }
+                    } else {
+                        continue;
                     }
-                    continue;
                 }
             }
 
