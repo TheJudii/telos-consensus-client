@@ -19,7 +19,10 @@ use antelope::chain::checksum::Checksum256;
 use antelope::chain::name::Name;
 use antelope::serializer::Packer;
 use eyre::eyre;
-use futures_util::future::join_all;
+use futures_util::{
+    future::join_all,
+    stream::{FuturesUnordered, StreamExt},
+};
 use reth_primitives::ReceiptWithBloom;
 use reth_telos_rpc_engine_api::structs::TelosEngineAPIExtraFields;
 use reth_trie_common::root::ordered_trie_root_with_encoder;
@@ -513,19 +516,19 @@ impl ProcessingEVMBlock {
             return HashValidation::Canonical;
         }
 
-        let results = join_all(
-            self.rpc_fallback_endpoints
-                .iter()
-                .cloned()
-                .map(|endpoint| Self::fetch_block_hash_from_rpc(endpoint, evm_block_num)),
-        )
-        .await;
+        let endpoint_count = self.rpc_fallback_endpoints.len();
+        let mut pending = self
+            .rpc_fallback_endpoints
+            .iter()
+            .cloned()
+            .map(|endpoint| Self::fetch_block_hash_from_rpc(endpoint, evm_block_num))
+            .collect::<FuturesUnordered<_>>();
 
         let mut votes: HashMap<B256, usize> = HashMap::new();
         let mut errors = Vec::new();
         let mut reachable = 0usize;
 
-        for (endpoint, result) in results {
+        while let Some((endpoint, result)) = pending.next().await {
             match result {
                 Ok(hash) => {
                     reachable += 1;
@@ -533,13 +536,39 @@ impl ProcessingEVMBlock {
                 }
                 Err(error) => errors.push(format!("{endpoint}: {error}")),
             }
+
+            let pending_count = pending.len();
+
+            // Do not make quorum=1 decisions early when more endpoints can still disagree.
+            // The final classifier intentionally refuses conflicting single-vote evidence.
+            if quorum > 1 {
+                if votes.get(&our_hash).copied().unwrap_or_default() >= quorum {
+                    return HashValidation::Canonical;
+                }
+
+                if let Some((reference_hash, votes)) = votes
+                    .iter()
+                    .filter(|(hash, _)| **hash != our_hash)
+                    .max_by_key(|(_, votes)| *votes)
+                {
+                    if *votes >= quorum && *votes >= 2 {
+                        return HashValidation::NonCanonical {
+                            reference_hash: *reference_hash,
+                        };
+                    }
+                }
+            }
+
+            if reachable + pending_count < quorum {
+                break;
+            }
         }
 
         Self::classify_hash_votes(
             evm_block_num,
             our_hash,
             quorum,
-            self.rpc_fallback_endpoints.len(),
+            endpoint_count,
             &votes,
             reachable,
             &errors,
