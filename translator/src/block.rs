@@ -171,6 +171,7 @@ pub enum GeneratedEvmData {
     },
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum HashValidation {
     Canonical,
     NonCanonical { reference_hash: B256 },
@@ -534,10 +535,63 @@ impl ProcessingEVMBlock {
             }
         }
 
+        Self::classify_hash_votes(
+            evm_block_num,
+            our_hash,
+            quorum,
+            self.rpc_fallback_endpoints.len(),
+            &votes,
+            reachable,
+            &errors,
+        )
+    }
+
+    fn classify_hash_votes(
+        evm_block_num: u64,
+        our_hash: B256,
+        quorum: usize,
+        endpoint_count: usize,
+        votes: &HashMap<B256, usize>,
+        reachable: usize,
+        errors: &[String],
+    ) -> HashValidation {
+        let mut tallies = votes
+            .iter()
+            .map(|(hash, votes)| format!("{hash}={votes}"))
+            .collect::<Vec<_>>();
+        tallies.sort();
+
+        let quorum_unavailable = |detail: String| {
+            HashValidation::QuorumUnavailable {
+                reason: format!(
+                    "canonical hash quorum unavailable for EVM block {}: {}; reachable={}/{}, quorum={}, tallies=[{}], errors=[{}]",
+                    evm_block_num,
+                    detail,
+                    reachable,
+                    endpoint_count,
+                    quorum,
+                    tallies.join(", "),
+                    errors.join("; ")
+                ),
+            }
+        };
+
+        if quorum == 1 && votes.len() > 1 {
+            return quorum_unavailable(
+                "reference RPCs disagree while quorum=1; refusing to choose a canonical hash from a single vote".to_string(),
+            );
+        }
+
+        if votes.get(&our_hash).copied().unwrap_or_default() >= quorum {
+            return HashValidation::Canonical;
+        }
+
         if let Some((reference_hash, votes)) = votes.iter().max_by_key(|(_, votes)| *votes) {
             if *votes >= quorum {
-                if *reference_hash == our_hash {
-                    return HashValidation::Canonical;
+                if *votes < 2 {
+                    return quorum_unavailable(format!(
+                        "refusing to mark local SHIP hash noncanonical with only {votes} reference RPC vote(s)"
+                    ));
                 }
 
                 return HashValidation::NonCanonical {
@@ -546,18 +600,12 @@ impl ProcessingEVMBlock {
             }
         }
 
-        let mut tallies = votes
-            .iter()
-            .map(|(hash, votes)| format!("{hash}={votes}"))
-            .collect::<Vec<_>>();
-        tallies.sort();
-
         HashValidation::QuorumUnavailable {
             reason: format!(
                 "canonical hash quorum unavailable for EVM block {}: reachable={}/{}, quorum={}, tallies=[{}], errors=[{}]",
                 evm_block_num,
                 reachable,
-                self.rpc_fallback_endpoints.len(),
+                endpoint_count,
                 quorum,
                 tallies.join(", "),
                 errors.join("; ")
@@ -670,8 +718,9 @@ impl ProcessingEVMBlock {
             }
         }
 
-        if let Some((reference_hash, memberships)) =
-            by_hash.iter().max_by_key(|(_, memberships)| memberships.len())
+        if let Some((reference_hash, memberships)) = by_hash
+            .iter()
+            .max_by_key(|(_, memberships)| memberships.len())
         {
             if memberships.len() >= quorum {
                 if memberships.iter().any(|contains_tx| *contains_tx) {
@@ -689,8 +738,15 @@ impl ProcessingEVMBlock {
         let mut tallies = by_hash
             .iter()
             .map(|(hash, memberships)| {
-                let includes = memberships.iter().filter(|contains_tx| **contains_tx).count();
-                format!("{hash}=votes:{},tx_included:{}", memberships.len(), includes)
+                let includes = memberships
+                    .iter()
+                    .filter(|contains_tx| **contains_tx)
+                    .count();
+                format!(
+                    "{hash}=votes:{},tx_included:{}",
+                    memberships.len(),
+                    includes
+                )
             })
             .collect::<Vec<_>>();
         tallies.sort();
@@ -758,8 +814,7 @@ impl ProcessingEVMBlock {
                     // Try RPC fallback if configured
                     if self.has_canonical_rpc() {
                         let raw_payload_hash = keccak256(&raw.tx);
-                        let raw_payload_hash_str =
-                            format!("0x{}", hex::encode(raw_payload_hash));
+                        let raw_payload_hash_str = format!("0x{}", hex::encode(raw_payload_hash));
                         let tx_hash_str = self.raw_action_transaction_hash(&raw).await?;
                         if tx_hash_str != raw_payload_hash_str {
                             debug!(
@@ -788,10 +843,7 @@ impl ProcessingEVMBlock {
                                 );
 
                                 match self
-                                    .validate_tx_membership_with_quorum(
-                                        evm_block_num,
-                                        &tx_hash_str,
-                                    )
+                                    .validate_tx_membership_with_quorum(evm_block_num, &tx_hash_str)
                                     .await
                                 {
                                     TxMembershipValidation::Included { reference_hash } => {
@@ -1239,7 +1291,10 @@ impl ProcessingEVMBlock {
                 });
             }
 
-            match self.validate_hash_with_quorum(evm_block_num, our_hash).await {
+            match self
+                .validate_hash_with_quorum(evm_block_num, our_hash)
+                .await
+            {
                 HashValidation::Canonical => {}
                 HashValidation::NonCanonical { reference_hash } => {
                     warn!(
@@ -1285,3 +1340,58 @@ impl PartialEq for ProcessingEVMBlock {
 }
 
 impl Eq for ProcessingEVMBlock {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn evm_hash(byte: u8) -> B256 {
+        B256::from([byte; 32])
+    }
+
+    #[test]
+    fn single_reference_vote_cannot_mark_block_noncanonical() {
+        let our_hash = evm_hash(0x11);
+        let reference_hash = evm_hash(0x22);
+        let votes = HashMap::from([(reference_hash, 1)]);
+
+        let validation =
+            ProcessingEVMBlock::classify_hash_votes(42, our_hash, 1, 2, &votes, 1, &[]);
+
+        match validation {
+            HashValidation::QuorumUnavailable { reason } => {
+                assert!(reason.contains("refusing to mark local SHIP hash noncanonical"));
+            }
+            other => panic!("expected quorum unavailable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn conflicting_single_vote_quorum_is_unavailable() {
+        let our_hash = evm_hash(0x11);
+        let reference_hash = evm_hash(0x22);
+        let votes = HashMap::from([(our_hash, 1), (reference_hash, 1)]);
+
+        let validation =
+            ProcessingEVMBlock::classify_hash_votes(42, our_hash, 1, 2, &votes, 2, &[]);
+
+        match validation {
+            HashValidation::QuorumUnavailable { reason } => {
+                assert!(reason.contains("reference RPCs disagree while quorum=1"));
+            }
+            other => panic!("expected quorum unavailable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn two_reference_votes_can_mark_block_noncanonical() {
+        let our_hash = evm_hash(0x11);
+        let reference_hash = evm_hash(0x22);
+        let votes = HashMap::from([(reference_hash, 2)]);
+
+        let validation =
+            ProcessingEVMBlock::classify_hash_votes(42, our_hash, 2, 3, &votes, 2, &[]);
+
+        assert_eq!(validation, HashValidation::NonCanonical { reference_hash });
+    }
+}
